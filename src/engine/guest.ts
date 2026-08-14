@@ -25,6 +25,7 @@ import { importNpm } from "./npm.js";
 import {
 	decodeMessage,
 	encodeMessage,
+	normalizeLosslessJsonValue,
 	type GuestToHostMessage,
 	type HostToGuestMessage,
 	NONCE_ENV,
@@ -257,6 +258,13 @@ function hostRequest(requestType: string, payload: Record<string, unknown> = {})
 	if (typeof requestType !== "string" || requestType.length === 0) {
 		return Promise.reject(new TypeError("requestType must be a non-empty string"));
 	}
+	// Lossless-JSON gate before the protocol pipe is touched: BigInt, NaN,
+	// circular, function, or symbol values would either throw mid-write or
+	// silently corrupt. `undefined` properties keep their legacy wire
+	// semantics (dropped in objects, null in arrays).
+	const checked = normalizeLosslessJsonValue(payload);
+	if (!checked.ok) return Promise.reject(checked.error);
+	payload = checked.value as Record<string, unknown>;
 	const id = `hr-${++hostRequestCounter}`;
 	const cellId = (cellStorage.getStore() ?? activeCell)?.cellId ?? "";
 	return new Promise((resolve, reject) => {
@@ -329,14 +337,22 @@ interface ToolReply extends Record<string, unknown> {
 	raw?: string;
 }
 
-const TOOLS_HANDLE: Record<string, unknown> = {
-	async call(name: string, args: Record<string, unknown> = {}): Promise<ToolReply> {
-		return (await hostRequest("tools.call", { name, args })) as ToolReply;
-	},
-};
+// Null-prototype so a tool name can never resolve through Object.prototype
+// (tools.constructor, tools.__proto__, …): the only names that exist are the
+// mounted tools plus `call`. Own keys are defined explicitly for the same
+// reason, matching DSH Code Mode's own-keys-only tools namespace.
+const TOOLS_HANDLE: Record<string, unknown> = Object.create(null);
+Object.defineProperty(TOOLS_HANDLE, "call", {
+	value: async (name: string, args: Record<string, unknown> = {}): Promise<ToolReply> =>
+		(await hostRequest("tools.call", { name, args })) as ToolReply,
+	enumerable: true,
+});
 for (const name of TOOL_NAMES) {
-	TOOLS_HANDLE[name] = async (args: Record<string, unknown> = {}): Promise<ToolReply> =>
-		(await hostRequest("tools.call", { name, args })) as ToolReply;
+	Object.defineProperty(TOOLS_HANDLE, name, {
+		value: async (args: Record<string, unknown> = {}): Promise<ToolReply> =>
+			(await hostRequest("tools.call", { name, args })) as ToolReply,
+		enumerable: true,
+	});
 }
 
 const RLM_HANDLE = {

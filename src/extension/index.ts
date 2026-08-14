@@ -22,6 +22,14 @@ const executeSchema = Type.Object({
 	code: Type.String({
 		description: "TypeScript to execute in the persistent Bun evaluator.",
 	}),
+	// DSH Code Mode parity: a one-line summary rides the cell record into
+	// the dispatch ledger; it is never executed.
+	description: Type.Optional(
+		Type.String({
+			description:
+				"Short summary of what this program does. Recorded with the cell for dispatch-log reconstruction and error attribution.",
+		}),
+	),
 });
 
 function syncRenderState(
@@ -125,6 +133,9 @@ export default function (pi: ExtensionAPI) {
 				// A snapshot is keyed to a session file; an ephemeral session has none
 				// to key it to, so its namespace lives and dies with the process.
 				snapshot: sessionKey ? { path: join(stateDir, "namespace.snapshot") } : undefined,
+				// DSH Code Mode parity: every bridged host request leaves one
+				// durable JSONL line for post-hoc reconstruction.
+				dispatchLog: sessionKey ? { path: join(stateDir, "dispatch.jsonl") } : undefined,
 			});
 		},
 		async dispose(engine) {
@@ -259,6 +270,8 @@ export default function (pi: ExtensionAPI) {
 			"Top-level await works. Shell: const out = await Bun.$`cmd`.quiet(); out.stdout.toString(). " +
 			"pi's file tools are mounted as tools.* (tools.read, tools.edit, tools.grep, ...). " +
 			"Subagents: await rlm.run(prompt) returns an admission handle; the child's answer lands in handle.output_file. " +
+			"Only what you print or the cell's final expression returns comes back to the model — curate it. " +
+			"Pass an optional `description` (one-line summary) so dispatch logs say what the program was for. " +
 			"The final expression of the cell is returned as the result.",
 		parameters: executeSchema,
 		renderShell: "self",
@@ -302,6 +315,7 @@ export default function (pi: ExtensionAPI) {
 					// One identity end to end: the transcript's toolCallId is the
 					// engine's cell id is the spawn_cell_id in frame records.
 					cellId: toolCallId,
+					description: params.description,
 					onStream: (chunk) => {
 						streamed += chunk;
 						onUpdate?.({ content: [{ type: "text", text: streamed }], details: {} });
@@ -328,6 +342,11 @@ export default function (pi: ExtensionAPI) {
 					stderr: r.stderr || undefined,
 					result: r.result,
 					errorStack: errorLines,
+					stdoutTruncated: r.stdoutTruncated,
+					stderrTruncated: r.stderrTruncated,
+					resultTruncated: r.resultTruncated,
+					outputLimitReached: r.outputLimitReached,
+					cellDescription: params.description,
 				};
 				const result = {
 					content: [

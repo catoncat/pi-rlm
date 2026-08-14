@@ -14,6 +14,13 @@ export interface ExecuteDetails {
 	stderr?: string;
 	result?: string;
 	errorStack?: string[];
+	/** Truncation and budget flags from the engine (DSH output-limit parity). */
+	stdoutTruncated?: boolean;
+	stderrTruncated?: boolean;
+	resultTruncated?: boolean;
+	outputLimitReached?: boolean;
+	/** The cell's optional one-line description, for display. */
+	cellDescription?: string;
 }
 
 export interface ExecuteRenderState {

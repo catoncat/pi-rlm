@@ -16,13 +16,14 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
 	decodeMessage,
 	encodeMessage,
+	normalizeLosslessJsonValue,
 	type GuestToHostMessage,
 	type HostToGuestMessage,
 	NONCE_ENV,
@@ -58,6 +59,17 @@ function resolveCellTimeoutMs(): number {
 	return n;
 }
 
+/** Combined stdout+stderr+result budget for one cell. Env: PI_RLM_MAX_COMBINED_OUTPUT_CHARS. */
+function resolveMaxCombinedOutputChars(perStreamMax: number): number {
+	const raw = process.env.PI_RLM_MAX_COMBINED_OUTPUT_CHARS;
+	if (raw !== undefined && raw !== "") {
+		const n = Number(raw);
+		if (Number.isFinite(n) && n >= 0) return n;
+	}
+	// Legacy worst case: stdout, stderr, and result could each hold a full cap.
+	return perStreamMax * 3;
+}
+
 export interface EngineExecuteError {
 	/** Error class name, e.g. "TypeError". */
 	name: string;
@@ -74,6 +86,12 @@ export interface ExecuteResult {
 	status: "ok" | "error" | "aborted";
 	error?: EngineExecuteError;
 	durationMs: number;
+	/** True when the stdout stream hit a cap (per-stream or combined). */
+	stdoutTruncated?: boolean;
+	stderrTruncated?: boolean;
+	resultTruncated?: boolean;
+	/** True when the shared stdout+stderr+result budget was exhausted. */
+	outputLimitReached?: boolean;
 }
 
 export interface ExecuteOptions {
@@ -82,6 +100,19 @@ export interface ExecuteOptions {
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
 	/** Cap stdout / stderr / result at this many characters. Default 65536. */
 	maxOutputChars?: number;
+	/**
+	 * Combined budget for stdout + stderr + result, in characters. Defaults
+	 * to 3 × maxOutputChars, so the legacy worst case is unchanged while the
+	 * three consumers now share one pool (DSH Code Mode's combined
+	 * logs+result cap). Env: PI_RLM_MAX_COMBINED_OUTPUT_CHARS.
+	 */
+	maxCombinedOutputChars?: number;
+	/**
+	 * Optional one-line summary of what this cell does (DSH Code Mode's
+	 * `description`). It is never executed; it rides the cell record into
+	 * the dispatch ledger and error attribution.
+	 */
+	description?: string;
 	/**
 	 * Caller-supplied cell identity (pi passes its toolCallId). One id then
 	 * flows from the transcript through the bridge into anything a handler
@@ -103,6 +134,8 @@ export interface HostRequestContext {
 	signal: AbortSignal;
 	/** The cell that issued this request — the caller's id when one was given. */
 	cellId: string;
+	/** The cell's optional one-line description, when the caller supplied one. */
+	cellDescription?: string;
 }
 
 /** Handles one typed request from guest code. Reply is sent back verbatim. */
@@ -144,6 +177,13 @@ export interface EngineOptions {
 		/** ... and untouched for at least this many cells. Default 8. */
 		deferMinAgeCells?: number;
 	};
+	/**
+	 * When set, every bridged host request (tools.*, rlm.run, …) appends one
+	 * JSON line here for durable reconstruction — the RLM analogue of DSH's
+	 * tool/code-dispatch ledger. Results are length-capped; args are not
+	 * logged. Best-effort: logging failures never break the bridge.
+	 */
+	dispatchLog?: { path: string };
 }
 
 /**
@@ -166,6 +206,8 @@ interface ActiveExecution {
 	code: string;
 	started: number;
 	maxChars: number;
+	combinedMax: number;
+	combinedUsed: number;
 	opts: ExecuteOptions;
 	stdout: string;
 	stderr: string;
@@ -210,6 +252,22 @@ function truncateWithMarker(text: string, maxChars: number, wasTruncated: boolea
 	return `${text.slice(0, maxChars)}\n[... output truncated at ${maxChars} chars ...]`;
 }
 
+/** Dispatch-log entries cap serialized results at this many characters. */
+const DISPATCH_LOG_VALUE_CAP = 4096;
+
+/** JSON-safe, length-capped copy of a value for the dispatch ledger. */
+function capLogValue(value: unknown): unknown {
+	if (value === undefined) return undefined;
+	try {
+		const json = JSON.stringify(value);
+		if (json === undefined) return { unserializable: true };
+		if (json.length <= DISPATCH_LOG_VALUE_CAP) return JSON.parse(json);
+		return { truncated: true, preview: json.slice(0, DISPATCH_LOG_VALUE_CAP) };
+	} catch {
+		return { unserializable: true };
+	}
+}
+
 export class EngineManager {
 	private readonly options: EngineOptions;
 	private child?: ChildProcess;
@@ -228,7 +286,7 @@ export class EngineManager {
 	 * would close the guest's write end and kill it with EPIPE. */
 	private protocolReader?: ReturnType<typeof createInterface>;
 	/** Abort + source per cell, retained past settlement for late bridge calls. */
-	private readonly cellRecords = new Map<string, { hostAbort: AbortController; code: string }>();
+	private readonly cellRecords = new Map<string, { hostAbort: AbortController; code: string; description?: string }>();
 	/** Set when an aborted cell may still be wedging the guest's event loop. */
 	private maybeWedged = false;
 	private snapshotTimer?: ReturnType<typeof setTimeout>;
@@ -500,6 +558,8 @@ export class EngineManager {
 		requestType: string,
 		payload: Record<string, unknown>,
 	): Promise<void> {
+		const started = Date.now();
+		let outcome: { status: "ok" | "error"; errorName?: string; errorMessage?: string; result?: unknown };
 		try {
 			const handler = this.options.hostHandlers?.[requestType];
 			if (!handler) {
@@ -516,23 +576,69 @@ export class EngineManager {
 			// the request would be attributed to a program that never asked for it
 			// and given no signal at all - host work spawned by a cell the agent has
 			// already cancelled, which nothing can then cancel.
-			const record = this.cellRecords.get(cellId);
+			const cellRecord = this.cellRecords.get(cellId);
 			// A cell we no longer have a record for is old enough to be an orphan.
 			// Refusing to grant an open-ended signal is the safe reading, and the
 			// source is reported as unknown rather than guessed: naming the most
 			// recent cell instead would be the same misattribution this exists to
 			// prevent, only harder to notice because it looks like an answer.
-			const signal = record ? record.hostAbort.signal : AbortSignal.abort();
-			const reply = await handler({ ...payload, cellSourceCode: record?.code }, { signal, cellId });
-			this.sendToGuest({ type: "host_reply", id, status: "ok", payload: reply });
+			const signal = cellRecord ? cellRecord.hostAbort.signal : AbortSignal.abort();
+			const reply = await handler(
+				{ ...payload, cellSourceCode: cellRecord?.code },
+				{ signal, cellId, cellDescription: cellRecord?.description },
+			);
+			// Lossless-JSON gate on the way back: a reply JSON.stringify would
+			// silently corrupt (undefined dropped, BigInt thrown mid-write) is
+			// normalized first, and genuinely unencodable values become the
+			// same teaching error a request would get.
+			const checked = normalizeLosslessJsonValue(reply);
+			if (!checked.ok) throw checked.error;
+			this.sendToGuest({ type: "host_reply", id, status: "ok", payload: checked.value });
+			outcome = { status: "ok", result: checked.value };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			this.sendToGuest({ type: "host_reply", id, status: "error", error: message });
+			outcome = {
+				status: "error",
+				errorName: error instanceof Error ? error.name : undefined,
+				errorMessage: message,
+			};
+		} finally {
+			this.appendDispatchLog(cellId, requestType, outcome, Date.now() - started);
 		}
 	}
 
-	private rememberCell(cellId: string, hostAbort: AbortController, code: string): void {
-		this.cellRecords.set(cellId, { hostAbort, code });
+	/** One durable JSONL line per bridged host request, DSH dispatch-ledger style. */
+	private appendDispatchLog(
+		cellId: string,
+		requestType: string,
+		outcome: { status: "ok" | "error"; errorName?: string; errorMessage?: string; result?: unknown },
+		durationMs: number,
+	): void {
+		const config = this.options.dispatchLog;
+		if (!config) return;
+		try {
+			mkdirSync(dirname(config.path), { recursive: true });
+			const entry: Record<string, unknown> = {
+				ts: new Date().toISOString(),
+				cellId,
+				cellDescription: this.cellRecords.get(cellId)?.description,
+				requestType,
+				durationMs,
+				status: outcome.status,
+			};
+			if (outcome.errorName !== undefined) entry.errorName = outcome.errorName;
+			if (outcome.errorMessage !== undefined) entry.errorMessage = outcome.errorMessage.slice(0, 500);
+			if (outcome.status === "ok") entry.result = capLogValue(outcome.result);
+			appendFileSync(config.path, `${JSON.stringify(entry)}\n`);
+		} catch {
+			// The ledger is best-effort observability: it must never break the
+			// bridge it records.
+		}
+	}
+
+	private rememberCell(cellId: string, hostAbort: AbortController, code: string, description?: string): void {
+		this.cellRecords.set(cellId, { hostAbort, code, description });
 		// Map iteration is insertion-ordered, so the oldest record is the first key.
 		while (this.cellRecords.size > MAX_CELL_RECORDS) {
 			const oldest = this.cellRecords.keys().next().value;
@@ -553,13 +659,18 @@ export class EngineManager {
 		if (active.abortRequested) return;
 		const key = name === "stdout" ? "stdout" : "stderr";
 		const truncatedKey = name === "stdout" ? "stdoutTruncated" : "stderrTruncated";
-		if (active[key].length < active.maxChars) {
+		// One shared budget across stdout, stderr, and the cell result; each
+		// stream additionally keeps the legacy per-stream cap. The streamed
+		// chunk is forwarded whole: streaming is observational, not history.
+		const room = Math.min(active.maxChars - active[key].length, active.combinedMax - active.combinedUsed);
+		if (room <= 0) {
+			active[truncatedKey] = true;
+		} else if (text.length <= room) {
 			active[key] += text;
-			if (active[key].length > active.maxChars) {
-				active[key] = active[key].slice(0, active.maxChars);
-				active[truncatedKey] = true;
-			}
+			active.combinedUsed += text.length;
 		} else {
+			active[key] += text.slice(0, room);
+			active.combinedUsed += room;
 			active[truncatedKey] = true;
 		}
 		active.opts.onStream?.(text, name);
@@ -622,6 +733,10 @@ export class EngineManager {
 				code,
 				started,
 				maxChars: opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS,
+				combinedMax:
+					opts.maxCombinedOutputChars ??
+					resolveMaxCombinedOutputChars(opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS),
+				combinedUsed: 0,
 				opts,
 				stdout: "",
 				stderr: "",
@@ -635,7 +750,7 @@ export class EngineManager {
 				reject,
 			};
 			this.activeExecution = active;
-			this.rememberCell(cellId, active.hostAbort, code);
+			this.rememberCell(cellId, active.hostAbort, code, opts.description);
 
 			let graceTimer: ReturnType<typeof setTimeout> | undefined;
 			let cellTimer: ReturnType<typeof setTimeout> | undefined;
@@ -722,8 +837,13 @@ export class EngineManager {
 		const stdout = truncateWithMarker(active.stdout, active.maxChars, active.stdoutTruncated);
 		const stderr = truncateWithMarker(active.stderr, active.maxChars, active.stderrTruncated);
 		let result = active.result;
-		if (result !== undefined && result.length > active.maxChars) {
-			result = truncateWithMarker(result, active.maxChars, true);
+		let resultTruncated = false;
+		if (result !== undefined) {
+			const resultRoom = Math.min(active.maxChars, Math.max(0, active.combinedMax - active.combinedUsed));
+			if (result.length > resultRoom) {
+				result = truncateWithMarker(result, resultRoom, true);
+				resultTruncated = true;
+			}
 		}
 
 		active.resolve({
@@ -733,6 +853,10 @@ export class EngineManager {
 			error: active.error,
 			status,
 			durationMs: Date.now() - active.started,
+			stdoutTruncated: active.stdoutTruncated,
+			stderrTruncated: active.stderrTruncated,
+			resultTruncated,
+			outputLimitReached: active.stdoutTruncated || active.stderrTruncated || resultTruncated,
 		});
 	}
 

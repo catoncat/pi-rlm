@@ -114,3 +114,68 @@ export function decodeMessage<T>(line: string, nonce?: string): T | null {
 		return null;
 	}
 }
+/**
+ * Lossless-JSON boundary for bridge traffic, mirroring DSH Code Mode's wire
+ * contract. JSON.stringify silently drops `undefined` properties and throws on
+ * BigInt/circular values — both are data corruption at the protocol boundary.
+ *
+ * This normalization keeps the legacy `undefined`-drop semantics (object keys
+ * with undefined values are omitted, array entries become null) while turning
+ * values that are genuinely unencodable (non-finite numbers, BigInt, symbols,
+ * functions, circular structures) into teaching errors that name the path.
+ */
+class DropUndefined {
+	readonly dropped = true;
+}
+const DROP_UNDEFINED = new DropUndefined();
+
+export function normalizeLosslessJsonValue(
+	value: unknown,
+): { ok: true; value: unknown } | { ok: false; error: TypeError } {
+	const seen = new Set<object>();
+	try {
+		const walk = (v: unknown, path: string): unknown => {
+			if (v === null || typeof v === "string" || typeof v === "boolean") return v;
+			if (typeof v === "number") {
+				if (!Number.isFinite(v)) {
+					throw new TypeError(
+						`${path} is a non-finite number (${String(v)}), which is not lossless JSON; use a finite number or null`,
+					);
+				}
+				return v;
+			}
+			if (typeof v === "undefined") return DROP_UNDEFINED;
+			if (typeof v === "bigint") {
+				throw new TypeError(`${path} is a BigInt, which is not lossless JSON; convert it first (e.g. value.toString())`);
+			}
+			if (typeof v === "function" || typeof v === "symbol") {
+				throw new TypeError(`${path} is a ${typeof v}, which is not lossless JSON`);
+			}
+			if (seen.has(v as object)) throw new TypeError(`${path} is circular and cannot be encoded as JSON`);
+			seen.add(v as object);
+			let out: unknown;
+			if (Array.isArray(v)) {
+				const arr = new Array(v.length);
+				for (let i = 0; i < v.length; i++) {
+					const item = walk(v[i], `${path}[${i}]`);
+					arr[i] = item instanceof DropUndefined ? null : item;
+				}
+				out = arr;
+			} else {
+				const obj: Record<string, unknown> = Object.create(null);
+				for (const key of Object.keys(v as object)) {
+					const item = walk((v as Record<string, unknown>)[key], `${path}.${key}`);
+					if (!(item instanceof DropUndefined)) obj[key] = item;
+				}
+				out = obj;
+			}
+			seen.delete(v as object);
+			return out;
+		};
+		const normalized = walk(value, "payload");
+		return { ok: true, value: normalized instanceof DropUndefined ? {} : normalized };
+	} catch (error) {
+		return { ok: false, error: error instanceof TypeError ? error : new TypeError(String(error)) };
+	}
+}
+
