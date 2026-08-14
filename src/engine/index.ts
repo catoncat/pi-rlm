@@ -49,6 +49,15 @@ const SNAPSHOT_REQUEST_TIMEOUT_MS = 30_000;
  */
 const MAX_CELL_RECORDS = 64;
 
+/** Wall-clock cap for a single execute cell. 0 disables. Env: PI_RLM_CELL_TIMEOUT_MS. */
+function resolveCellTimeoutMs(): number {
+	const raw = process.env.PI_RLM_CELL_TIMEOUT_MS;
+	if (raw === undefined || raw === "") return 300_000; // 5 minutes
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0) return 300_000;
+	return n;
+}
+
 export interface EngineExecuteError {
 	/** Error class name, e.g. "TypeError". */
 	name: string;
@@ -629,31 +638,65 @@ export class EngineManager {
 			this.rememberCell(cellId, active.hostAbort, code);
 
 			let graceTimer: ReturnType<typeof setTimeout> | undefined;
-			const onAbort = () => {
+			let cellTimer: ReturnType<typeof setTimeout> | undefined;
+			const clearTimers = () => {
+				if (graceTimer) clearTimeout(graceTimer);
+				if (cellTimer) clearTimeout(cellTimer);
+				graceTimer = undefined;
+				cellTimer = undefined;
+			};
+			const requestCancel = (kind: "aborted" | "timeout") => {
+				if (active.settled || active.abortRequested) return;
 				active.abortRequested = true;
 				active.hostAbort.abort();
 				this.sendToGuest({ type: "abort", cellId });
 				this.maybeWedged = true;
 				graceTimer = setTimeout(() => {
 					if (this.activeExecution === active && !active.settled) {
-						active.status = "aborted";
+						if (kind === "timeout") {
+							const seconds = Math.round(resolveCellTimeoutMs() / 1000);
+							active.status = "error";
+							active.error = {
+								name: "CellTimeoutError",
+								message:
+									`execute cell exceeded wall-clock limit (${seconds}s). ` +
+									"Break work into smaller cells, and give every wait/poll loop a deadline " +
+									"(e.g. `const end = Date.now() + 60_000` in the loop condition) so it can " +
+									"return partial results instead of being killed here. " +
+									`Override with PI_RLM_CELL_TIMEOUT_MS (0 disables).`,
+								stack: ["CellTimeoutError: cell wall-clock timeout"],
+							};
+						} else {
+							active.status = "aborted";
+						}
 						this.settleActiveExecution(active);
+						// Timeout is a trust boundary: cooperative abort may not stop a
+						// synchronous loop. Tear down the guest immediately and skip every
+						// later snapshot/dispose request against it.
+						if (kind === "timeout") this.killSync();
 					}
 				}, ABORT_GRACE_MS);
 				graceTimer.unref?.();
 			};
+			const onAbort = () => requestCancel("aborted");
 			opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+			const cellTimeoutMs = resolveCellTimeoutMs();
+			if (cellTimeoutMs > 0) {
+				cellTimer = setTimeout(() => requestCancel("timeout"), cellTimeoutMs);
+				cellTimer.unref?.();
+			}
 
 			const originalResolve = active.resolve;
 			active.resolve = (result) => {
 				opts.signal?.removeEventListener("abort", onAbort);
-				if (graceTimer) clearTimeout(graceTimer);
+				clearTimers();
 				originalResolve(result);
 			};
 			const originalReject = active.reject;
 			active.reject = (error) => {
 				opts.signal?.removeEventListener("abort", onAbort);
-				if (graceTimer) clearTimeout(graceTimer);
+				clearTimers();
 				originalReject(error);
 			};
 

@@ -169,8 +169,16 @@ function validationError(def: MountedTool, args: unknown): string | undefined {
 	return `tools.${def.name}: invalid arguments — ${problems}. Expected: ${toolSignature(def)}`;
 }
 
+function resolveDefaultBashTimeoutSeconds(): number {
+	const raw = process.env.PI_RLM_BASH_TIMEOUT_SECONDS ?? process.env.PI_BASH_DEFAULT_TIMEOUT_SECONDS;
+	if (raw === undefined || raw === "") return 180;
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? n : 180;
+}
+
 export function createPiToolsHost(options: { cwd: string }): PiToolsHost {
 	const definitions = buildDefinitions(options.cwd);
+	const defaultBashTimeoutSeconds = resolveDefaultBashTimeoutSeconds();
 	let pendingImages: ImageBlock[] = [];
 	let callCounter = 0;
 	// Paths whose full content this session has seen through the bridge: read
@@ -195,7 +203,14 @@ export function createPiToolsHost(options: { cwd: string }): PiToolsHost {
 					`Unknown tool "${name}".${suggestion ? ` Did you mean "${suggestion}"?` : ""} Available: ${available}.`,
 				);
 			}
-			const args = payload.args && typeof payload.args === "object" ? payload.args : {};
+			const args = payload.args && typeof payload.args === "object" ? { ...(payload.args as Record<string, unknown>) } : {};
+			// Same policy as the host bash-timeout extension: never let bridged bash hang forever.
+			if (name === "bash") {
+				const timeout = args.timeout;
+				if (timeout === undefined || timeout === null || (typeof timeout === "number" && timeout <= 0)) {
+					args.timeout = defaultBashTimeoutSeconds;
+				}
+			}
 			const invalid = validationError(def, args);
 			if (invalid) throw new Error(invalid);
 

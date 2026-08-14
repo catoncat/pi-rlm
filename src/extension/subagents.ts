@@ -120,9 +120,18 @@ export interface SubagentHost {
 	killAll(): void;
 }
 
+function resolveSubagentTimeoutMs(): number {
+	const raw = process.env.PI_RLM_SUBAGENT_TIMEOUT_MS;
+	if (raw === undefined || raw === "") return 600_000; // 10 minutes
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0) return 600_000;
+	return n;
+}
+
 export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 	const registry = new Map<string, SubagentEntry>();
 	const children = new Map<string, ReturnType<typeof spawn>>();
+	const lifetimeTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	// Deleting a running child races its exit event: SIGTERM fires "exit" after
 	// the delete handler already removed the frame file, and an unguarded exit
 	// write would resurrect it. Discarding routes all later writes to nowhere.
@@ -253,7 +262,37 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 			registry.set(childId, entry);
 			children.set(childId, child);
 
+			const clearLifetime = () => {
+				const timer = lifetimeTimers.get(childId);
+				if (timer) clearTimeout(timer);
+				lifetimeTimers.delete(childId);
+			};
+
+			const maxLifeMs = resolveSubagentTimeoutMs();
+			if (maxLifeMs > 0) {
+				const timer = setTimeout(() => {
+					const live = children.get(childId);
+					if (!live) return;
+					// Hard deadline so a stuck child cannot pin the parent forever.
+					live.kill("SIGTERM");
+					setTimeout(() => {
+						if (children.has(childId)) live.kill("SIGKILL");
+					}, 5_000).unref?.();
+					entry.status = "error";
+					entry.exit_code = entry.exit_code ?? 124;
+					// Keep the durable half in step with the registry: a child killed
+					// on deadline must not stay "running" in the frame view.
+					frame.status = "error";
+					frame.exit_code = entry.exit_code;
+					frame.finished_at = new Date().toISOString();
+					writeFrame();
+				}, maxLifeMs);
+				timer.unref?.();
+				lifetimeTimers.set(childId, timer);
+			}
+
 			child.on("exit", (code) => {
+				clearLifetime();
 				entry.exit_code = code;
 				entry.status = code === 0 ? "completed" : "error";
 				frame.status = entry.status;
@@ -263,6 +302,7 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 				children.delete(childId);
 			});
 			child.on("error", () => {
+				clearLifetime();
 				entry.status = "error";
 				frame.status = "error";
 				frame.finished_at = new Date().toISOString();
@@ -291,6 +331,11 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 				registry.get(target) ?? [...registry.values()].find((candidate) => candidate.session_name === target);
 			if (!entry) throw new Error(`rlm.delete_subagent: no subagent matches "${target}"`);
 			const child = children.get(entry.rlm_child_id);
+			const life = lifetimeTimers.get(entry.rlm_child_id);
+			if (life) {
+				clearTimeout(life);
+				lifetimeTimers.delete(entry.rlm_child_id);
+			}
 			if (child) {
 				child.kill("SIGTERM");
 				children.delete(entry.rlm_child_id);
@@ -309,6 +354,8 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 		handlers,
 		entries: () => [...registry.values()],
 		killAll: () => {
+			for (const timer of lifetimeTimers.values()) clearTimeout(timer);
+			lifetimeTimers.clear();
 			for (const child of children.values()) child.kill("SIGKILL");
 			children.clear();
 		},

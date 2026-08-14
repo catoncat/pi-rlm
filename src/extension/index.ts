@@ -306,6 +306,10 @@ export default function (pi: ExtensionAPI) {
 						details,
 						images: images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
 					});
+					// A wall-clock timeout means the guest may still be executing the
+					// cancelled cell (especially synchronous loops). Kill it immediately;
+					// never let shutdown attempt a snapshot against a possibly wedged guest.
+					if (r.error?.name === "CellTimeoutError") await lifecycle.discard();
 					throw new Error(text || "(no output)");
 				}
 				return result;
