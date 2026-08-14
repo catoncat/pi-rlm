@@ -1,10 +1,10 @@
 /**
  * pi-rlm: RLM engine for pi.
  *
- * A single LLM-facing tool, `execute`, running TypeScript in a persistent Bun
- * evaluator. Everything else — shell, files, subagents, host callbacks — is
- * expressed as code inside that tool rather than as more tools, which is what
- * lets capabilities grow without changing the interface the model sees.
+ * Primary LLM-facing tool: `execute`, running TypeScript in a persistent Bun
+ * evaluator. File builtins are bridged as tools.* inside that evaluator.
+ * Local keep-all (see keep-tools.ts) also leaves extension host tools
+ * model-visible so session UI and delegation keep working under RLM.
  */
 
 import { basename, join } from "node:path";
@@ -12,7 +12,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { EngineBusyError, EngineManager } from "../engine/index.js";
 import { createPiToolsHost, type PiToolsHost } from "./pi-tools.js";
-import { buildRlmTsPrompt, type RlmPromptModels } from "./prompt.js";
+import { resolveRlmActiveTools, resolveRlmDropSet, summarizeHostTool } from "./keep-tools.js";
+import { buildRlmTsPrompt, type RlmPromptModels, type RlmPromptSkill } from "./prompt.js";
 import { ExecuteCellComponent, type ExecuteDetails, type ExecuteRenderState, makeFrameSource } from "./render.js";
 import { EngineLifecycle, summarizeNames } from "./session-engine.js";
 import { createSubagentHost, resolveDefaultSubagentModel, type SubagentHost } from "./subagents.js";
@@ -149,8 +150,33 @@ export default function (pi: ExtensionAPI) {
 		// tools it describes are actually registered in this configuration.
 		if (!active()) return undefined;
 		resolveModels(ctx);
-		const options = (event as { systemPromptOptions?: { contextFiles?: Array<{ path: string; content: string }> } })
-			.systemPromptOptions;
+		// Re-assert keep-all each turn so later before_agent_start handlers that
+		// append themselves (ask_user_question, advisor) still see a full base,
+		// and so a mid-session setActiveTools collapse cannot stick.
+		const drop = resolveRlmDropSet();
+		const all = pi.getAllTools();
+		const activeNames = resolveRlmActiveTools(
+			all.map((t) => t.name),
+			{ drop, always: ["execute"] },
+		);
+		pi.setActiveTools(activeNames);
+		const hostToolSummaries = all
+			.filter((t) => t.name !== "execute" && activeNames.includes(t.name))
+			.map(summarizeHostTool);
+		// Everything pi resolved for this turn's prompt. Narrowing this cast to
+		// contextFiles alone is how skills went missing: pi loads them, offers
+		// them here, and a prompt that replaces pi's own must pass them on or
+		// they are silently dropped. Read the whole payload, decide nothing
+		// about which skills qualify — that is pi's config and each skill's
+		// disable-model-invocation flag.
+		const options = (
+			event as {
+				systemPromptOptions?: {
+					contextFiles?: Array<{ path: string; content: string }>;
+					skills?: readonly RlmPromptSkill[];
+				};
+			}
+		).systemPromptOptions;
 		return {
 			systemPrompt: buildRlmTsPrompt({
 				cwd: ctx.cwd,
@@ -158,9 +184,11 @@ export default function (pi: ExtensionAPI) {
 				depth: DEPTH,
 				allowRecursion: DEPTH < MAX_DEPTH,
 				contextFiles: options?.contextFiles,
+				skills: options?.skills,
 				// Fresh definitions for the prompt: signatures come from the same
 				// schemas the bridge validates against, so they cannot drift.
 				toolSummaries: createPiToolsHost({ cwd: ctx.cwd }).describe(),
+				hostToolSummaries,
 				models: modelsSeed,
 			}),
 		};
@@ -173,8 +201,15 @@ export default function (pi: ExtensionAPI) {
 			pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "execute"));
 			return;
 		}
-		// Active: the whole LLM surface collapses to the one tool.
-		pi.setActiveTools(["execute"]);
+		// Active: keep extension tools model-visible; drop bridged builtins
+		// (available as tools.* inside execute) plus a short extra exclude list.
+		const drop = resolveRlmDropSet();
+		pi.setActiveTools(
+			resolveRlmActiveTools(
+				pi.getAllTools().map((t) => t.name),
+				{ drop, always: ["execute"] },
+			),
+		);
 		// A new session may run under different auth or a different model.
 		modelsSeed = undefined;
 		// Resolve before the engine is built below, so the subagent host is

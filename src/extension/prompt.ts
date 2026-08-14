@@ -7,7 +7,24 @@
  * cannot call. What it teaches instead is the working style the evaluator
  * rewards: keep state in variables, run shell commands in-language, delegate
  * with subagents, and let each cell build on the last.
+ *
+ * Skills are rendered with pi's own `formatSkillsForPrompt`, so the
+ * `disable-model-invocation` frontmatter switch and the XML shape stay
+ * pi's decision, not a copy that can drift.
  */
+
+import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
+
+/**
+ * A pi skill as far as the prompt is concerned. Structural, so a pi that adds
+ * fields to Skill still type-checks here.
+ */
+export interface RlmPromptSkill {
+	name: string;
+	description: string;
+	filePath: string;
+	disableModelInvocation?: boolean;
+}
 
 export interface RlmPromptOptions {
 	cwd: string;
@@ -15,8 +32,22 @@ export interface RlmPromptOptions {
 	depth?: number;
 	allowRecursion?: boolean;
 	contextFiles?: Array<{ path: string; content: string }>;
-	/** One line per mounted host tool, from the bridge's own schemas. */
+	/** One line per mounted evaluator tool (tools.*), from the bridge's own schemas. */
 	toolSummaries?: string[];
+	/**
+	 * Model-visible host tools kept alongside execute (extension tools that the
+	 * cell cannot replace: ask_user_question, advisor, subagent, …). One line
+	 * each, name + first sentence. Empty/omitted → stock single-tool surface.
+	 */
+	hostToolSummaries?: string[];
+	/**
+	 * Skills pi already loaded for this turn, passed through untouched from
+	 * `systemPromptOptions.skills`. Which skills reach this array (user vs
+	 * project dirs, --skill paths) is pi's own resolution; which of them the
+	 * model may auto-invoke is each skill's `disable-model-invocation`, applied
+	 * by pi's formatter. Nothing here is enumerated or filtered locally.
+	 */
+	skills?: readonly RlmPromptSkill[];
 	/**
 	 * Model landscape, seeded once per session by the extension. The rendered
 	 * section is deterministic for identical inputs — the system prompt is
@@ -115,6 +146,43 @@ const SUBAGENT_GUIDANCE = [
 	"Use `await rlm.listSubagents()` to recover handles you lost. Delete a child with `await rlm.deleteSubagent(idOrName)` when it is no longer needed.",
 ].join("\n");
 
+function buildHostVisibleToolsSection(summaries: readonly string[]): string {
+	return [
+		"# Model-visible host tools",
+		"",
+		"Besides `execute`, these tools stay on the model tool list. Call them as normal top-level tools — not as `tools.*` inside a cell (the evaluator bridge only mounts the file builtins).",
+		"",
+		"Division of labour:",
+		"- **execute / tools.*** — files, shell, search, data wrangling, anything that benefits from persistent variables across cells.",
+		"- **Host tools below** — session UI, asking the user, advisor review, subagent/intercom delegation, and any capability that needs a real ExtensionContext.",
+		"- Do not reimplement a host tool inside a cell. Do not drop to normal mode just to reach one of these.",
+		"- For repository mutation and multi-agent workflows prefer the host `subagent` tool over `rlm.run` when both exist; use `rlm.run` for lightweight in-cell fanout only.",
+		"",
+		...summaries.map((line) => `- ${line}`),
+	].join("\n");
+}
+
+/**
+ * Skills section, delegated to pi's formatter.
+ *
+ * pi gates this section on the `read` tool being on the model surface, because
+ * a skill is an instruction to go read a file. Under RLM `read` is bridged into
+ * the evaluator instead of listed as a tool, so the capability is present while
+ * the name is not: reproduce the intent by pointing at `tools.read` rather than
+ * reproducing the check, which would suppress every skill.
+ */
+function buildSkillsSection(skills: readonly RlmPromptSkill[]): string | undefined {
+	const section = formatSkillsForPrompt(skills as Parameters<typeof formatSkillsForPrompt>[0]).trim();
+	// Empty when every skill opted out via disable-model-invocation.
+	if (!section) return undefined;
+	return [
+		section,
+		"",
+		"There is no `read` tool here: load a skill with `tools.read({ path })` inside a cell, using the <location> path above.",
+		"A skill's instructions are written for a normal tool surface. Follow what it means, not its literal tool names: file steps become `tools.*` or Bun.$ in a cell, and its commands run through Bun.$.",
+	].join("\n");
+}
+
 export function buildRlmTsPrompt(options: RlmPromptOptions): string {
 	const depth = options.depth ?? 0;
 	const allowRecursion = options.allowRecursion ?? true;
@@ -151,6 +219,17 @@ export function buildRlmTsPrompt(options: RlmPromptOptions): string {
 
 	if (options.toolSummaries && options.toolSummaries.length > 0) {
 		parts.push("", buildHostToolsSection(options.toolSummaries));
+	}
+
+	if (options.hostToolSummaries && options.hostToolSummaries.length > 0) {
+		parts.push("", buildHostVisibleToolsSection(options.hostToolSummaries));
+	}
+
+	// Before Project Context: AGENTS.md routes to skills by name, so the roster
+	// it refers to should already be in view when those rules are read.
+	if (options.skills && options.skills.length > 0) {
+		const skillsSection = buildSkillsSection(options.skills);
+		if (skillsSection) parts.push("", "# Skills", "", skillsSection);
 	}
 
 	if (options.contextFiles && options.contextFiles.length > 0) {
