@@ -116,14 +116,17 @@ if (prompt.includes("Division of labour") || prompt.includes("Ask the user struc
 }
 console.log("E prompt section ok");
 
-// rlm-toggle is a directory extension (index.ts + keep-tools.ts); older layout was flat files.
-const EXT_DIR = process.env.PI_AGENT_EXTENSIONS_DIR ?? join(homedir(), ".pi", "agent", "extensions");
+// rlm-toggle 现在作为独立包安装(github.com/catoncat/pi-rlm-local → packages/rlm-toggle/src);
+// 旧布局(~/.pi/agent/extensions 目录扩展)仍兼容,P I_RLM_TOGGLE_SRC_DIR 可覆盖。
+const EXT_DIR = process.env.PI_RLM_TOGGLE_SRC_DIR ?? join(homedir(), ".pi", "agent", "git", "github.com", "catoncat", "pi-rlm-local", "packages", "rlm-toggle", "src");
 const toggleKeep = [
-  join(EXT_DIR, "rlm-toggle/keep-tools.ts"),
+  join(EXT_DIR, "keep-tools.ts"),
+  join(EXT_DIR, "rlm-toggle", "keep-tools.ts"),
   join(EXT_DIR, "rlm-keep-tools.ts"),
 ].find(existsSync);
 const toggle = [
-  join(EXT_DIR, "rlm-toggle/index.ts"),
+  join(EXT_DIR, "index.ts"),
+  join(EXT_DIR, "rlm-toggle", "index.ts"),
   join(EXT_DIR, "rlm-toggle.ts"),
 ].find(existsSync);
 if (!toggleKeep || !toggle) {
