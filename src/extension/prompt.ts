@@ -137,6 +137,8 @@ const SUBAGENT_GUIDANCE = [
 	'Check each child\'s status before trusting its output: a child that ended "error" may have written nothing useful. Decide explicitly what a failed branch means for the task instead of silently synthesizing around it.',
 	"Fan in as values: parse, compare, and reduce the outputs in cells. When combining many long answers, a final synthesis child that reads the output files and writes one verdict is often better than merging prose yourself.",
 	"Use `await rlm.listSubagents()` to recover handles you lost. Delete a child with `await rlm.deleteSubagent(idOrName)` when it is no longer needed.",
+	"",
+	"`subagent` (host tool, when present) spawns a full peer session with a `contact_supervisor` escalation channel — use it for long-running workers that must escalate decisions; `rlm.run` is the lightweight fan-out path whose child only writes an output file and cannot escalate.",
 ].join("\n");
 
 function buildHostVisibleToolsSection(summaries: readonly string[]): string {
