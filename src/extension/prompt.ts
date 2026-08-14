@@ -68,20 +68,13 @@ export interface RlmPromptModels {
 /** Group "provider/id" strings into stable "provider: id, id" lines. */
 function buildModelsSection(models: RlmPromptModels): string | undefined {
 	if (models.available.length === 0 && !models.current) return undefined;
-	const byProvider = new Map<string, string[]>();
-	for (const entry of [...models.available].sort()) {
-		const slash = entry.indexOf("/");
-		const provider = slash > 0 ? entry.slice(0, slash) : "other";
-		const id = slash > 0 ? entry.slice(slash + 1) : entry;
-		const ids = byProvider.get(provider) ?? [];
-		if (!ids.includes(id)) ids.push(id);
-		byProvider.set(provider, ids);
-	}
 	const lines = [
 		models.current ? `You are running ${models.current}.` : undefined,
 		`Children default to ${models.subagentDefault}; override per spawn with \`{ model: "provider/id" }\`.`,
-		byProvider.size > 0
-			? `Available models: ${[...byProvider.entries()].map(([provider, ids]) => `${provider}: ${ids.join(", ")}`).join(" · ")}`
+		// The full provider/model roster costs ~2k tokens per turn and churns the
+		// prompt cache whenever any provider changes; model_list serves it on demand.
+		models.available.length > 0
+			? "Other providers/models are configured; call `model_list` to enumerate them."
 			: undefined,
 	].filter((line): line is string => line !== undefined);
 	return lines.join("\n");
@@ -147,18 +140,15 @@ const SUBAGENT_GUIDANCE = [
 ].join("\n");
 
 function buildHostVisibleToolsSection(summaries: readonly string[]): string {
+	// Names only: each tool's full description already ships in its schema, so
+	// per-tool summary lines here were pure duplication (~1.1k tokens per turn).
+	const names = summaries.map((line) => line.split(" — ")[0] ?? line);
 	return [
 		"# Model-visible host tools",
 		"",
-		"Besides `execute`, these tools stay on the model tool list. Call them as normal top-level tools — not as `tools.*` inside a cell (the evaluator bridge only mounts the file builtins).",
+		"Besides `execute`, these tools stay on the model tool list. Call them as normal top-level tools — not as `tools.*` inside a cell (the evaluator bridge only mounts the file builtins). Do not reimplement one inside a cell; their descriptions are in the tool schemas.",
 		"",
-		"Division of labour:",
-		"- **execute / tools.*** — files, shell, search, data wrangling, anything that benefits from persistent variables across cells.",
-		"- **Host tools below** — session UI, asking the user, advisor review, subagent/intercom delegation, and any capability that needs a real ExtensionContext.",
-		"- Do not reimplement a host tool inside a cell. Do not drop to normal mode just to reach one of these.",
-		"- For repository mutation and multi-agent workflows prefer the host `subagent` tool over `rlm.run` when both exist; use `rlm.run` for lightweight in-cell fanout only.",
-		"",
-		...summaries.map((line) => `- ${line}`),
+		names.join(", "),
 	].join("\n");
 }
 
