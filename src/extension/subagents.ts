@@ -11,12 +11,14 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { HostRequestHandlers } from "../engine/index.js";
 import type { FrameRecord } from "./frames.js";
 
 export type SubagentStatus = "running" | "completed" | "error";
+
+type SpawnSpec = { command: string; args: string[] };
 
 export interface SubagentEntry {
 	rlm_child_id: string;
@@ -26,6 +28,10 @@ export interface SubagentEntry {
 	model: string;
 	status: SubagentStatus;
 	exit_code: number | null;
+	/** ISO timestamp; mirrors the frame record so the registry answers as fully as disk. */
+	spawned_at: string;
+	/** ISO timestamp, set on exit; absent while still running. */
+	finished_at?: string;
 	pid: number | undefined;
 }
 
@@ -128,6 +134,121 @@ function resolveSubagentTimeoutMs(): number {
 	return n;
 }
 
+/**
+ * A short, bounded head of a subagent's output file, for `reason` on error.
+ *
+ * The whole file is never read: a child that failed after streaming megabytes
+ * must not cost the parent the same megabytes just to explain the failure. The
+ * head is the right slice anyway — the failure the issue is about (extension
+ * load error) prints on the first line, before any business output exists.
+ * A missing file (spawn never wrote) yields undefined rather than a throw, so a
+ * poll never fails because the output it wanted to summarize is absent.
+ */
+function readOutputHead(outputFile: string, maxBytes = 512): string | undefined {
+	let fd: number;
+	try {
+		fd = openSync(outputFile, "r");
+	} catch {
+		return undefined;
+	}
+	try {
+		const buffer = Buffer.alloc(maxBytes);
+		const read = readSync(fd, buffer, 0, maxBytes, 0);
+		if (read <= 0) return undefined;
+		const text = buffer.subarray(0, read).toString("utf8").trim();
+		return text.length > 0 ? text : undefined;
+	} catch {
+		return undefined;
+	} finally {
+		try {
+			closeSync(fd);
+		} catch {}
+	}
+}
+
+/**
+ * What a parent actually gets back when it lists subagents.
+ *
+ * One name for one concept: `rlm.run` replies with `name`, so the registry
+ * must too — a poll that matches on `entry.name` has to work. (It did not,
+ * and the resulting waits timed out silently instead of detecting completion.)
+ *
+ * Beyond that identity, the registry now answers as fully as the frame record
+ * on disk does: `exit_code`, `spawned_at`, `finished_at`, and
+ * `duration_ms`. Those last two are what the parent needs to tell a timeout
+ * (exit 124) from a business failure (exit 1) and to collect load stats — with
+ * status alone both look identical. `duration_ms` is elapsed wall time for a
+ * settled child only; a running child exposes `spawned_at` and the parent can
+ * compute elapsed itself. `reason` on error carries the child's own first
+ * output so a load failure is one poll away instead of a file read away.
+ */
+export function toPublicEntry(entry: SubagentEntry): Record<string, unknown> {
+	const finishedAt = entry.finished_at;
+	const elapsed = finishedAt === undefined ? undefined : Date.parse(finishedAt) - Date.parse(entry.spawned_at);
+	const durationMs = elapsed === undefined ? undefined : Math.max(0, Math.round(elapsed));
+	const reason = entry.status === "error" ? readOutputHead(entry.output_file) : undefined;
+	return {
+		rlm_child_id: entry.rlm_child_id,
+		name: entry.session_name,
+		session_dir: entry.session_dir,
+		output_file: entry.output_file,
+		model: entry.model,
+		status: entry.status,
+		exit_code: entry.exit_code,
+		spawned_at: entry.spawned_at,
+		...(finishedAt === undefined ? {} : { finished_at: finishedAt, duration_ms: durationMs }),
+		...(reason === undefined ? {} : { reason }),
+	};
+}
+
+/**
+ * The child command plus a pre-flight guard on the extension it will load.
+ *
+ * The child spawns as `pi -p --no-extensions -e <extensionPath>`, where the
+ * extension is this module's own `index.ts`. If that path has gone missing —
+ * an `npm install` that reset node_modules, a diverged checkout, a half-built
+ * transpile — admission used to still succeed: the child then died with
+ * "Failed to load extension ... path does not exist" and the parent only learnt
+ * it seconds later by polling, with no hint that the path it spawned is not the
+ * path it is itself running from. Stat the path first and fail the rlm.run call
+ * synchronously, naming the real path and the parent's own location so the
+ * divergence is visible at the point of action rather than after the fan-out is
+ * already lost.
+ */
+export function buildDefaultSpawnSpec(
+	model: string,
+	name: string,
+	subagentDir: string,
+	prompt: string,
+	extensionPath = join(import.meta.dirname, "index.ts"),
+): SpawnSpec {
+	if (!existsSync(extensionPath)) {
+		throw new Error(
+			`rlm.run refused: the child would load the extension from "${extensionPath}", which does not exist. ` +
+				`The parent extension is running from "${import.meta.dirname}", so its install was mutated out from under it ` +
+				`(an npm install or a moved checkout). Refresh the install or point the child at a live checkout before delegating.`,
+		);
+	}
+	return {
+		command: "pi",
+		args: [
+			"-p",
+			"--no-extensions",
+			"-e",
+			extensionPath,
+			"--provider",
+			model.includes("/") ? model.slice(0, model.indexOf("/")) : "anthropic",
+			"--model",
+			model.includes("/") ? model.slice(model.indexOf("/") + 1) : model,
+			"--session-dir",
+			subagentDir,
+			"--name",
+			name,
+			prompt,
+		],
+	};
+}
+
 export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 	const registry = new Map<string, SubagentEntry>();
 	const children = new Map<string, ReturnType<typeof spawn>>();
@@ -136,21 +257,6 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 	// the delete handler already removed the frame file, and an unguarded exit
 	// write would resurrect it. Discarding routes all later writes to nowhere.
 	const discardFrame = new Map<string, () => void>();
-
-	function toPublicEntry(entry: SubagentEntry): Record<string, unknown> {
-		// One name for one concept: rlm.run replies with `name`, so the registry
-		// must too — a poll that matches on `entry.name` has to work. (It did
-		// not, and the resulting waits timed out silently instead of detecting
-		// completion.)
-		return {
-			rlm_child_id: entry.rlm_child_id,
-			name: entry.session_name,
-			session_dir: entry.session_dir,
-			output_file: entry.output_file,
-			model: entry.model,
-			status: entry.status,
-		};
-	}
 
 	const handlers: HostRequestHandlers = {
 		"rlm.run": async (payload, context) => {
@@ -176,6 +282,10 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 			mkdirSync(options.subagentDir, { recursive: true });
 			const outputFile = join(options.subagentDir, `${childId}.output.md`);
 
+			// One timestamp for the registry and the frame, so the live answer and
+			// the durable record cannot disagree on when a child was admitted.
+			const spawnedAt = new Date().toISOString();
+
 			const entry: SubagentEntry = {
 				rlm_child_id: childId,
 				session_name: name,
@@ -184,6 +294,7 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 				model,
 				status: "running",
 				exit_code: null,
+				spawned_at: spawnedAt,
 				pid: undefined,
 			};
 
@@ -197,7 +308,7 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 				prompt,
 				model,
 				status: "running",
-				spawned_at: new Date().toISOString(),
+				spawned_at: spawnedAt,
 				...(context?.cellId ? { spawn_cell_id: context.cellId } : {}),
 				...(options.selfChildId ? { parent_child_id: options.selfChildId } : {}),
 			};
@@ -219,24 +330,7 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 
 			const spec = options.spawnCommand
 				? options.spawnCommand(entry, prompt)
-				: {
-						command: "pi",
-						args: [
-							"-p",
-							"--no-extensions",
-							"-e",
-							join(import.meta.dirname, "index.ts"),
-							"--provider",
-							model.includes("/") ? model.slice(0, model.indexOf("/")) : "anthropic",
-							"--model",
-							model.includes("/") ? model.slice(model.indexOf("/") + 1) : model,
-							"--session-dir",
-							options.subagentDir,
-							"--name",
-							name,
-							prompt,
-						],
-					};
+				: buildDefaultSpawnSpec(model, name, options.subagentDir, prompt);
 
 			const outFd = openSync(outputFile, "w");
 			const child = spawn(spec.command, spec.args, {
@@ -284,7 +378,9 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 					// on deadline must not stay "running" in the frame view.
 					frame.status = "error";
 					frame.exit_code = entry.exit_code;
-					frame.finished_at = new Date().toISOString();
+					const finishedAt = new Date().toISOString();
+					entry.finished_at = finishedAt;
+					frame.finished_at = finishedAt;
 					writeFrame();
 				}, maxLifeMs);
 				timer.unref?.();
@@ -295,17 +391,21 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 				clearLifetime();
 				entry.exit_code = code;
 				entry.status = code === 0 ? "completed" : "error";
+				const finishedAt = new Date().toISOString();
+				entry.finished_at = finishedAt;
 				frame.status = entry.status;
 				frame.exit_code = code;
-				frame.finished_at = new Date().toISOString();
+				frame.finished_at = finishedAt;
 				writeFrame();
 				children.delete(childId);
 			});
 			child.on("error", () => {
 				clearLifetime();
 				entry.status = "error";
+				const finishedAt = new Date().toISOString();
+				entry.finished_at = finishedAt;
 				frame.status = "error";
-				frame.finished_at = new Date().toISOString();
+				frame.finished_at = finishedAt;
 				writeFrame();
 				children.delete(childId);
 			});

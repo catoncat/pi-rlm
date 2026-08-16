@@ -8,11 +8,17 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EngineManager } from "../src/engine/index.js";
-import { createSubagentHost, defaultSubagentName } from "../src/extension/subagents.js";
+import {
+	buildDefaultSpawnSpec,
+	createSubagentHost,
+	defaultSubagentName,
+	type SubagentEntry,
+	toPublicEntry,
+} from "../src/extension/subagents.js";
 
 const managers: EngineManager[] = [];
 const tempDirs: string[] = [];
@@ -186,5 +192,97 @@ describe("subagent host", () => {
 		expect(defaultSubagentName("Fix the parser bug!", "sub-abc12345")).toMatch(
 			/^subagent-fix-the-parser-bug-[a-z0-9]+$/,
 		);
+	});
+
+	// ── the registry answers as fully as disk ─────────────────────────────────
+	// A parent that polls listSubagents must be able to tell a timeout (exit 124)
+	// from a business failure (exit 1), and to collect durations for load stats —
+	// with status alone both look identical. The public entry must therefore
+	// carry exit_code, spawned_at, finished_at, duration_ms, and a reason on error.
+
+	test("toPublicEntry exposes exit_code, spawn/finish timestamps, duration_ms, and reason", async () => {
+		const d = tempDir();
+		const outputFile = join(d, "child.output.md");
+		writeFileSync(outputFile, "Error: Failed to load extension: path does not exist\n");
+		const settled: SubagentEntry = {
+			rlm_child_id: "sub-1",
+			session_name: "worker",
+			session_dir: d,
+			output_file: outputFile,
+			model: "anthropic/haiku",
+			status: "error",
+			exit_code: 3,
+			spawned_at: "2026-08-14T10:00:00.000Z",
+			finished_at: "2026-08-14T10:00:01.250Z",
+			pid: undefined,
+		};
+		const pub = toPublicEntry(settled);
+		expect(pub.exit_code).toBe(3);
+		expect(pub.status).toBe("error");
+		expect(pub.spawned_at).toBe("2026-08-14T10:00:00.000Z");
+		expect(pub.finished_at).toBe("2026-08-14T10:00:01.250Z");
+		expect(pub.duration_ms).toBe(1250);
+		expect(pub.reason).toContain("Failed to load extension");
+
+		// A still-running child: no finished_at, no duration_ms, no reason, but a
+		// spawned_at so the parent can compute elapsed itself.
+		const running = toPublicEntry({ ...settled, status: "running", finished_at: undefined, exit_code: null });
+		expect(running.finished_at).toBeUndefined();
+		expect(running.duration_ms).toBeUndefined();
+		expect(running.reason).toBeUndefined();
+		expect(typeof running.spawned_at).toBe("string");
+
+		// A completed child exposes exit_code 0 and a duration but no reason.
+		const done = toPublicEntry({ ...settled, status: "completed", exit_code: 0 });
+		expect(done.exit_code).toBe(0);
+		expect(done.reason).toBeUndefined();
+		expect(typeof done.duration_ms).toBe("number");
+	});
+
+	test("failed child's listSubagents entry carries exit_code, timestamp, duration, and reason", async () => {
+		const d = tempDir();
+		const host = fakeHost(d, 'echo "boom: extension path does not exist" >&2; exit 3');
+		const m = new EngineManager({ hostHandlers: host.handlers });
+		managers.push(m);
+		const r = await m.execute(`
+			const h = await rlm.run("doomed task");
+			let entry;
+			for (let i = 0; i < 50; i++) {
+				const { subagents } = await rlm.listSubagents();
+				entry = subagents.find((s) => s.rlm_child_id === h.rlm_child_id);
+				if (entry.status !== "running") break;
+				await new Promise((r) => setTimeout(r, 100));
+			}
+			\`exit=\${entry.exit_code}|status=\${entry.status}|fin=\${typeof entry.finished_at}|dur=\${typeof entry.duration_ms}|reason=\${entry.reason ?? ""}\`
+		`);
+		expect(r.status).toBe("ok");
+		expect(r.result).toContain("exit=3");
+		expect(r.result).toContain("status=error");
+		expect(r.result).toContain("fin=string");
+		expect(r.result).toContain("dur=number");
+		expect(r.result).toContain("reason=boom: extension path does not exist");
+	});
+
+	// ── pre-flight guard at admission ──────────────────────────────────────────
+	// The child spawns `pi -p --no-extensions -e <extensionPath>`. If that path
+	// has gone missing (npm install reset node_modules, moved checkout), admission
+	// used to still succeed and the failure surfaced only seconds later by
+	// polling. The guard must fail the rlm.run call synchronously instead.
+
+	test("buildDefaultSpawnSpec stats the extension path and fails fast when it is missing", () => {
+		const missing = join(tmpdir(), "definitely-not-here", "index.ts");
+		expect(() => buildDefaultSpawnSpec("anthropic/haiku", "worker", "/tmp/subs", "task", missing)).toThrow(
+			/rlm.run refused.*does not exist/s,
+		);
+
+		// A real, existing path builds the spec with -e pointing at it.
+		const d = tempDir();
+		const real = join(d, "index.ts");
+		writeFileSync(real, "");
+		const spec = buildDefaultSpawnSpec("anthropic/haiku", "worker", d, "task", real);
+		expect(spec.command).toBe("pi");
+		expect(spec.args).toContain("-e");
+		expect(spec.args).toContain(real);
+		expect(spec.args[spec.args.length - 1]).toBe("task");
 	});
 });
