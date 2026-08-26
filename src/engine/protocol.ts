@@ -146,7 +146,9 @@ export function normalizeLosslessJsonValue(
 			}
 			if (typeof v === "undefined") return DROP_UNDEFINED;
 			if (typeof v === "bigint") {
-				throw new TypeError(`${path} is a BigInt, which is not lossless JSON; convert it first (e.g. value.toString())`);
+				throw new TypeError(
+					`${path} is a BigInt, which is not lossless JSON; convert it first (e.g. value.toString())`,
+				);
 			}
 			if (typeof v === "function" || typeof v === "symbol") {
 				throw new TypeError(`${path} is a ${typeof v}, which is not lossless JSON`);
@@ -178,4 +180,3 @@ export function normalizeLosslessJsonValue(
 		return { ok: false, error: error instanceof TypeError ? error : new TypeError(String(error)) };
 	}
 }
-

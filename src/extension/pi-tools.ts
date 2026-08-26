@@ -203,7 +203,8 @@ export function createPiToolsHost(options: { cwd: string }): PiToolsHost {
 					`Unknown tool "${name}".${suggestion ? ` Did you mean "${suggestion}"?` : ""} Available: ${available}.`,
 				);
 			}
-			const args = payload.args && typeof payload.args === "object" ? { ...(payload.args as Record<string, unknown>) } : {};
+			const args =
+				payload.args && typeof payload.args === "object" ? { ...(payload.args as Record<string, unknown>) } : {};
 			// Same policy as the host bash-timeout extension: never let bridged bash hang forever.
 			if (name === "bash") {
 				const timeout = args.timeout;

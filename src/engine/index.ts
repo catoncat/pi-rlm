@@ -23,10 +23,10 @@ import { fileURLToPath } from "node:url";
 import {
 	decodeMessage,
 	encodeMessage,
-	normalizeLosslessJsonValue,
 	type GuestToHostMessage,
 	type HostToGuestMessage,
 	NONCE_ENV,
+	normalizeLosslessJsonValue,
 	PROTOCOL_FD,
 } from "./protocol.js";
 
@@ -568,7 +568,11 @@ export class EngineManager {
 		payload: Record<string, unknown>,
 	): Promise<void> {
 		const started = Date.now();
-		let outcome: { status: "ok" | "error"; errorName?: string; errorMessage?: string; result?: unknown };
+		let outcome: { status: "ok" | "error"; errorName?: string; errorMessage?: string; result?: unknown } = {
+			status: "error",
+			errorName: "Error",
+			errorMessage: "host request did not complete",
+		};
 		try {
 			const handler = this.options.hostHandlers?.[requestType];
 			if (!handler) {
@@ -602,7 +606,12 @@ export class EngineManager {
 			// same teaching error a request would get.
 			const checked = normalizeLosslessJsonValue(reply);
 			if (!checked.ok) throw checked.error;
-			this.sendToGuest({ type: "host_reply", id, status: "ok", payload: checked.value });
+			this.sendToGuest({
+				type: "host_reply",
+				id,
+				status: "ok",
+				payload: checked.value as Record<string, unknown>,
+			});
 			outcome = { status: "ok", result: checked.value };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -743,8 +752,7 @@ export class EngineManager {
 				started,
 				maxChars: opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS,
 				combinedMax:
-					opts.maxCombinedOutputChars ??
-					resolveMaxCombinedOutputChars(opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS),
+					opts.maxCombinedOutputChars ?? resolveMaxCombinedOutputChars(opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS),
 				combinedUsed: 0,
 				opts,
 				stdout: "",

@@ -13,24 +13,13 @@
  */
 
 /** Mounted inside the evaluator as tools.*; dropped from the model list by default. */
-export const BRIDGED_BUILTIN_TOOLS = [
-	"read",
-	"bash",
-	"edit",
-	"write",
-	"grep",
-	"find",
-	"ls",
-] as const;
+export const BRIDGED_BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 
 /**
  * Default extras: internal/meta tools that waste schema or fight RLM.
  * Keep this list short — new extension tools should appear automatically.
  */
-export const DEFAULT_EXTRA_DROP_TOOLS = [
-	"compaction_continue_state",
-	"watchdog_answer",
-] as const;
+export const DEFAULT_EXTRA_DROP_TOOLS = ["compaction_continue_state", "watchdog_answer"] as const;
 
 export function resolveRlmDropSet(env: NodeJS.ProcessEnv = process.env): Set<string> {
 	const raw = env.PI_RLM_DROP_TOOLS;

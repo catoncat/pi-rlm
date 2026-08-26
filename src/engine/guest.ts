@@ -28,10 +28,10 @@ import { importNpm } from "./npm.js";
 import {
 	decodeMessage,
 	encodeMessage,
-	normalizeLosslessJsonValue,
 	type GuestToHostMessage,
 	type HostToGuestMessage,
 	NONCE_ENV,
+	normalizeLosslessJsonValue,
 	PROTOCOL_FD,
 } from "./protocol.js";
 import { transformCell } from "./transform.js";

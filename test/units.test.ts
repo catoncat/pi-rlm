@@ -423,10 +423,11 @@ describe("system prompt", () => {
 			available: ["openai/gpt-5.2", "anthropic/claude-haiku-4-5", "anthropic/claude-opus-4-6"],
 		};
 		const prompt = buildRlmTsPrompt({ cwd: "/w", allowRecursion: true, models });
-		expect(prompt).toContain("anthropic/claude-fable-5");
-		expect(prompt).toContain("anthropic/haiku");
-		expect(prompt).toContain("anthropic: claude-haiku-4-5, claude-opus-4-6");
-		expect(prompt).toContain("openai: gpt-5.2");
+		expect(prompt).toContain("You are running anthropic/claude-fable-5.");
+		expect(prompt).toContain("Children default to anthropic/haiku");
+		expect(prompt).toContain("call `model_list` to enumerate them");
+		expect(prompt).not.toContain("anthropic: claude-haiku-4-5, claude-opus-4-6");
+		expect(prompt).not.toContain("openai/gpt-5.2");
 
 		const shuffled = { ...models, available: [...models.available].reverse() };
 		expect(buildRlmTsPrompt({ cwd: "/w", allowRecursion: true, models: shuffled })).toBe(prompt);
