@@ -87,6 +87,13 @@ const EVALUATOR_CONTROL_PROMPT = [
 	"",
 	"Run shell commands in-language with Bun.$: const out = await Bun.$`cmd args`.quiet() — then `out.stdout.toString()`, `out.stderr.toString()`, and `out.exitCode` are ordinary values you can assign, slice, and branch on. Use `.nothrow()` when a non-zero exit is expected. Each Bun.$ call is a fresh subshell: shell-level state (cd, export, shell variables) does NOT carry between calls. Use `process.chdir()` and `process.env.VAR = ...` in the evaluator for state that must persist, or chain dependent shell steps inside one Bun.$ template.",
 	"",
+	// Two friction classes measured in the 2026-09 session audit (skills/pi-session-audit):
+	// Bun.$ template parse failures (232 cells / 113 sessions) and cells used as
+	// wait timers that hit the wall clock (the largest residual hang class).
+	"Bun.$ parses its template itself, not through bash: escaped parens (\\( \\)), `$(...)` substitution, redirect chains, heredocs, and nested quoting fail with parse errors, and a dollar-brace inside the template is JS interpolation, not shell parameter expansion. When a command needs any of that, write it to a file with `Bun.write('/tmp/step.sh', script)` and run `Bun.$`bash /tmp/step.sh``.",
+	"",
+	"Each cell has a wall-clock limit (about 300 s, PI_RLM_CELL_TIMEOUT_MS); exceeding it kills the cell and restarts the evaluator. Never park a cell on a long sleep or poll loop, a headless `pi` run, a server, or a watcher: start such work detached (`Bun.spawn` with stdout to a log file, or `nohup … &` from a script), return immediately, and check the log or status in a later cell. Keep any single in-cell wait well under a minute.",
+	"",
 	"Do not install dependencies into the evaluator just to make an external project import or run there. If a project import, test, script, CLI, or dependency check is needed, run it through that project's own environment and normal command interface (its documented commands, package scripts, venv, etc.) and treat failures from that native environment as the relevant result.",
 	"",
 	"Use code for reading, searching, and editing files (Bun.file, node:fs, Bun.$`grep ...`). Always assign read/search results to named top-level variables so you can revisit, filter, and slice them later without re-reading.",
