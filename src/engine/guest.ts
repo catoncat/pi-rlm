@@ -339,9 +339,35 @@ function guardShellInterpolation(shell: typeof Bun.$): typeof Bun.$ {
 					);
 				}
 			}
-			return Reflect.apply(target as (...a: unknown[]) => unknown, thisArg, args);
+			try {
+				return Reflect.apply(target as (...a: unknown[]) => unknown, thisArg, args);
+			} catch (error) {
+				throw withShellParseHint(error);
+			}
 		},
 	});
+}
+
+/**
+ * Bun.$ parses its template with its own shell grammar, synchronously, at the
+ * call. Its parse errors name the token but not the way out ("Unexpected
+ * token: `(`", "expected a command or assignment but got: \"Redirect\""),
+ * and the 2026-09 session audit counted 232 such cells in 113 sessions, mostly
+ * followed by blind re-quoting. Append the way out, once, like transform.ts
+ * does for compile errors.
+ */
+const SHELL_PARSE_HINT =
+	"Bun.$ parsed this template with its own shell grammar, not bash: escaped parens, redirect chains, heredocs and nested quoting are not supported. " +
+	"Write the command to a file with Bun.write('/tmp/step.sh', script) and run Bun.$`bash /tmp/step.sh` instead.";
+
+function withShellParseHint(error: unknown): unknown {
+	if (!(error instanceof Error) || error.message.includes(SHELL_PARSE_HINT)) return error;
+	const fromParser =
+		/^(Unexpected token|expected a command or assignment|Unexpected EOF|Unterminated)/i.test(error.message) ||
+		(error.stack ?? "").includes("BunShell");
+	if (!fromParser) return error;
+	error.message = `${error.message}\n${SHELL_PARSE_HINT}`;
+	return error;
 }
 
 const GUARDED_SHELL = guardShellInterpolation(Bun.$);
@@ -387,6 +413,29 @@ for (const name of TOOL_NAMES) {
 			(await hostRequest("tools.call", { name, args })) as ToolReply,
 		enumerable: true,
 	});
+}
+
+/**
+ * Two ways a cell reaches for a tool that lives on the model surface instead:
+ * `tools.rlm_mode(...)` (only the file builtins are mounted) and a bare
+ * `recall(...)` / `ffgrep(...)` (the scope proxy resolves unknown names to
+ * globalThis, so the call fails as "is not a function"). Bun's message already
+ * names the identifier; add where the tool actually is. Only bare identifiers
+ * and tools.* members qualify — `out.trim is not a function` is an ordinary
+ * bug and gets no hint.
+ */
+const MISCALL_RE = /^(tools\.)?([A-Za-z_$][\w$]*) is not a function\b/;
+const MOUNTED_TOOLS_TEXT = `tools.${TOOL_NAMES.join(", tools.")} (and tools.call)`;
+
+function withHostToolHint(message: string): string {
+	const m = MISCALL_RE.exec(message);
+	if (!m) return message;
+	const [, viaTools, name] = m;
+	if (viaTools && (TOOL_NAMES as readonly string[]).includes(name)) return message;
+	const hint = viaTools
+		? `tools.${name} is not mounted in the evaluator; only ${MOUNTED_TOOLS_TEXT} are. If ${name} is a model-visible host tool, call it as a top-level tool from the assistant turn, not from a cell.`
+		: `${name} is not defined in the evaluator. If it is a model-visible host tool, call it as a top-level tool from the assistant turn; cells only reach the bridged file tools as ${MOUNTED_TOOLS_TEXT}.`;
+	return `${message}\n${hint}`;
 }
 
 const RLM_HANDLE = {
@@ -464,7 +513,7 @@ async function runCell(cellId: string, code: string): Promise<void> {
 			type: "done",
 			cellId,
 			status: ctx.aborted ? "aborted" : "error",
-			error: { name: err.name, message: err.message, stack: (err.stack ?? "").split("\n") },
+			error: { name: err.name, message: withHostToolHint(err.message), stack: (err.stack ?? "").split("\n") },
 		};
 	} finally {
 		if (activeCell === ctx) activeCell = undefined;

@@ -191,6 +191,32 @@ describe("result shape", () => {
 		expect(r2.result).toContain("123");
 	});
 
+	test("a Bun.$ parse error carries the write-a-script hint, once", async () => {
+		const m = engine();
+		const r = await m.execute("await Bun.$`ls > /tmp/x 2>&1 | head`.quiet();");
+		expect(r.status).toBe("error");
+		expect(r.error?.message).toContain("Redirect");
+		expect(r.error?.message).toContain("bash /tmp/step.sh");
+		expect(r.error?.message.split("bash /tmp/step.sh")).toHaveLength(2);
+		// Ordinary shell failures (non-zero exit) are not parse errors and get no hint.
+		const r2 = await m.execute("await Bun.$`exit 3`.quiet();");
+		expect(r2.status).toBe("error");
+		expect(r2.error?.message).not.toContain("bash /tmp/step.sh");
+	});
+
+	test("calling a host tool from a cell, bare or as tools.*, says where it lives", async () => {
+		const m = engine();
+		const bare = await m.execute("recall({ query: 'x' })");
+		expect(bare.status).toBe("error");
+		expect(bare.error?.message).toContain("top-level tool");
+		const viaTools = await m.execute("await tools.rlm_mode({ mode: 'normal' })");
+		expect(viaTools.status).toBe("error");
+		expect(viaTools.error?.message).toContain("tools.rlm_mode is not mounted");
+		// A member call on an ordinary value is a plain bug: no tool hint.
+		const plain = await m.execute("const out = 1; out.trim()");
+		expect(plain.error?.message).not.toContain("top-level tool");
+	});
+
 	test("syntax error is a normal error result, not a crash", async () => {
 		const m = engine();
 		const r = await m.execute("let let let");
