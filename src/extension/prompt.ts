@@ -56,6 +56,15 @@ export interface RlmPromptOptions {
 	 * cached, and a shifting list would invalidate that cache every turn.
 	 */
 	models?: RlmPromptModels;
+	/**
+	 * Whether the session has a UI (pi's ctx.hasUI). Decides the one line that
+	 * says whether anything can wake the agent after a turn ends: an interactive
+	 * session is woken by the process tool and async subagents; a headless
+	 * `pi -p` or subagent session exits at agent_end, so "start it and wait for
+	 * the notification" silently abandons the work (eval t05, 2026-09-19).
+	 * Omitted → no line, for callers that do not know.
+	 */
+	interactive?: boolean;
 }
 
 export interface RlmPromptModels {
@@ -187,6 +196,19 @@ function buildSkillsSection(skills: readonly RlmPromptSkill[]): string | undefin
 	].join("\n");
 }
 
+/**
+ * One paragraph, constant for the whole session (hasUI never changes), so it
+ * costs nothing in cache terms. It has to override the process-tool guidance
+ * above it for headless sessions: there, ending the turn ends the process.
+ */
+function buildSessionModeSection(interactive: boolean | undefined): string | undefined {
+	if (interactive === undefined) return undefined;
+	if (interactive) {
+		return "Session mode: interactive. Work started through the `process` tool or an async subagent wakes you when it is ready, fails, or exits — you may end your turn and wait for that notification.";
+	}
+	return "Session mode: headless (no UI). Nothing wakes you once your turn ends — not the `process` tool, not a subagent: ending the turn ends this session, and work left running is abandoned. Wait for long work inside cells (a sleep or poll of at most 240 s per cell, then re-check in the next cell) or run it to completion before you answer; never finish with work still pending.";
+}
+
 export function buildRlmTsPrompt(options: RlmPromptOptions): string {
 	const depth = options.depth ?? 0;
 	const allowRecursion = options.allowRecursion ?? true;
@@ -220,6 +242,9 @@ export function buildRlmTsPrompt(options: RlmPromptOptions): string {
 	}
 
 	parts.push("", EVALUATOR_CONTROL_PROMPT);
+
+	const sessionMode = buildSessionModeSection(options.interactive);
+	if (sessionMode) parts.push("", sessionMode);
 
 	if (options.toolSummaries && options.toolSummaries.length > 0) {
 		parts.push("", buildHostToolsSection(options.toolSummaries));

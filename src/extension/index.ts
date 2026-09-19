@@ -282,6 +282,7 @@ export default function (pi: ExtensionAPI) {
 				toolSummaries: createPiToolsHost({ cwd: ctx.cwd }).describe(),
 				hostToolSummaries,
 				models: modelsSeed,
+				interactive: ctx.hasUI,
 			}),
 		};
 	});

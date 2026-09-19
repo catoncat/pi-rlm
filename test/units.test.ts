@@ -346,6 +346,20 @@ describe("system prompt", () => {
 		expect(prompt).toContain("shell command");
 	});
 
+	// A headless session exits at agent_end, so "start it and wait to be woken"
+	// abandons the work; the prompt must say which world the model is in and
+	// stay silent when the caller does not know.
+	test("session mode line: interactive waits for wake-ups, headless waits in cells, unknown says nothing", () => {
+		const interactive = buildRlmTsPrompt({ cwd: "/tmp", interactive: true });
+		expect(interactive).toContain("Session mode: interactive");
+		expect(interactive).toMatch(/wakes you/);
+		const headless = buildRlmTsPrompt({ cwd: "/tmp", interactive: false });
+		expect(headless).toContain("Session mode: headless");
+		expect(headless).toContain("ending the turn ends this session");
+		expect(headless).toContain("240 s per cell");
+		expect(buildRlmTsPrompt({ cwd: "/tmp" })).not.toContain("Session mode:");
+	});
+
 	test("advertises npm: imports so the agent reaches for them before bun add", () => {
 		const prompt = buildRlmTsPrompt({ cwd: "/tmp" });
 		expect(prompt).toContain('import { z } from "npm:zod@4"');
