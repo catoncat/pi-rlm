@@ -147,38 +147,6 @@ export function resolveRlmEnsuredSurface(
 	return out;
 }
 
-/**
- * Build the active tool list for an RLM session.
- * `always` names are forced on when present in `allToolNames` (execute, and
- * locally rlm_mode). Everything else is kept unless it is in the drop set.
- * `execute` is sorted first when present so the primary surface stays obvious.
- */
-export function resolveRlmActiveTools(
-	allToolNames: readonly string[],
-	options?: { drop?: ReadonlySet<string>; always?: readonly string[] },
-): string[] {
-	const drop = options?.drop ?? resolveRlmDropSet();
-	const always = options?.always ?? ["execute"];
-	const alwaysSet = new Set(always);
-	const available = new Set(allToolNames);
-	const out: string[] = [];
-	const seen = new Set<string>();
-
-	const push = (name: string) => {
-		if (seen.has(name) || !available.has(name)) return;
-		seen.add(name);
-		out.push(name);
-	};
-
-	for (const name of always) push(name);
-	for (const name of allToolNames) {
-		if (alwaysSet.has(name)) continue;
-		if (drop.has(name)) continue;
-		push(name);
-	}
-	return out;
-}
-
 /** Order-insensitive equality, so an unchanged surface is never re-applied. */
 export function sameToolSet(a: readonly string[], b: readonly string[]): boolean {
 	if (a.length !== b.length) return false;
