@@ -5,3 +5,4 @@ node_modules/
 
 # Local experiment artifacts (session transcripts, A/B runs)
 rig/
+package-lock.json
