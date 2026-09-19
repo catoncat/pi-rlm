@@ -32,6 +32,8 @@ export interface SubagentEntry {
 	spawned_at: string;
 	/** ISO timestamp, set on exit; absent while still running. */
 	finished_at?: string;
+	/** Set when the hard lifetime deadline sent a signal to the child group. */
+	timed_out?: boolean;
 	pid: number | undefined;
 }
 
@@ -197,6 +199,7 @@ export function toPublicEntry(entry: SubagentEntry): Record<string, unknown> {
 		exit_code: entry.exit_code,
 		spawned_at: entry.spawned_at,
 		...(finishedAt === undefined ? {} : { finished_at: finishedAt, duration_ms: durationMs }),
+		...(entry.timed_out === undefined ? {} : { timed_out: entry.timed_out }),
 		...(reason === undefined ? {} : { reason }),
 	};
 }
@@ -335,8 +338,8 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 			const outFd = openSync(outputFile, "w");
 			const child = spawn(spec.command, spec.args, {
 				cwd: options.cwd,
-				detached: false,
 				stdio: ["ignore", outFd, outFd],
+				detached: true,
 				// PI_RLM_FORCE activates the child regardless of flag plumbing: the
 				// child loads this extension via -e and must enter the RLM world
 				// without depending on --rlm surviving pi's argv handling.
@@ -366,22 +369,21 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 			if (maxLifeMs > 0) {
 				const timer = setTimeout(() => {
 					const live = children.get(childId);
-					if (!live) return;
-					// Hard deadline so a stuck child cannot pin the parent forever.
-					live.kill("SIGTERM");
-					setTimeout(() => {
-						if (children.has(childId)) live.kill("SIGKILL");
-					}, 5_000).unref?.();
-					entry.status = "error";
-					entry.exit_code = entry.exit_code ?? 124;
-					// Keep the durable half in step with the registry: a child killed
-					// on deadline must not stay "running" in the frame view.
-					frame.status = "error";
-					frame.exit_code = entry.exit_code;
-					const finishedAt = new Date().toISOString();
-					entry.finished_at = finishedAt;
-					frame.finished_at = finishedAt;
+					if (!live || live.pid === undefined) return;
+					// The child command may be a shell wrapper. Signal its detached
+					// process group so the real pi/node descendant cannot outlive it.
+					entry.timed_out = true;
+					frame.timed_out = true;
 					writeFrame();
+					try {
+						process.kill(-live.pid, "SIGTERM");
+					} catch {}
+					setTimeout(() => {
+						if (!children.has(childId) || live.pid === undefined) return;
+						try {
+							process.kill(-live.pid, "SIGKILL");
+						} catch {}
+					}, 5_000).unref?.();
 				}, maxLifeMs);
 				timer.unref?.();
 				lifetimeTimers.set(childId, timer);
@@ -396,6 +398,7 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 				frame.status = entry.status;
 				frame.exit_code = code;
 				frame.finished_at = finishedAt;
+				frame.timed_out = entry.timed_out;
 				writeFrame();
 				children.delete(childId);
 			});

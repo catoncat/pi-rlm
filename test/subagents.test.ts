@@ -87,14 +87,43 @@ describe("subagent host", () => {
 		expect(r.result).toContain("completed|child-output-proof");
 	});
 
-	test("failed child is reported as error in the registry", async () => {
+	test("subagent timeout kills the detached process group and settles on exit", async () => {
 		const d = tempDir();
-		const host = fakeHost(d, "exit 3");
-		const m = new EngineManager({ hostHandlers: host.handlers });
-		managers.push(m);
-		await m.execute('await rlm.run("doomed task");');
-		await new Promise((resolve) => setTimeout(resolve, 300));
-		expect(host.entries()[0].status).toBe("error");
+		const pidFile = join(d, "grandchild.pid");
+		const previousTimeout = process.env.PI_RLM_SUBAGENT_TIMEOUT_MS;
+		process.env.PI_RLM_SUBAGENT_TIMEOUT_MS = "100";
+		try {
+			const host = createSubagentHost({
+				cwd: d,
+				subagentDir: d,
+				defaultModel: "anthropic/haiku",
+				depth: 0,
+				maxDepth: 2,
+				spawnCommand: () => ({
+					command: "bash",
+					args: ["-lc", `sleep 30 & echo $! > ${pidFile}; wait`],
+				}),
+			});
+			const m = new EngineManager({ hostHandlers: host.handlers });
+			managers.push(m);
+			await m.execute('await rlm.run("timeout me");');
+			for (let i = 0; i < 40 && host.entries()[0]?.status === "running"; i++) await new Promise((r) => setTimeout(r, 25));
+			const entry = host.entries()[0];
+			expect(entry?.status).toBe("error");
+			expect(entry?.timed_out).toBe(true);
+			expect(entry?.finished_at).toEqual(expect.any(String));
+			const grandchildPid = Number(readFileSync(pidFile, "utf8"));
+			let alive = true;
+			try {
+				process.kill(grandchildPid, 0);
+			} catch {
+				alive = false;
+			}
+			expect(alive).toBe(false);
+		} finally {
+			if (previousTimeout === undefined) delete process.env.PI_RLM_SUBAGENT_TIMEOUT_MS;
+			else process.env.PI_RLM_SUBAGENT_TIMEOUT_MS = previousTimeout;
+		}
 	});
 
 	test("depth limit refuses recursion beyond maxDepth", async () => {

@@ -25,6 +25,8 @@ export interface FrameRecord {
 	/** The agent that spawned this frame, linking depth n+1 to depth n. */
 	parent_child_id?: string;
 	exit_code?: number | null;
+	/** A hard lifetime deadline signalled this child group. */
+	timed_out?: boolean;
 	pid?: number;
 }
 
