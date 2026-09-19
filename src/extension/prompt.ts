@@ -35,9 +35,11 @@ export interface RlmPromptOptions {
 	/** One line per mounted evaluator tool (tools.*), from the bridge's own schemas. */
 	toolSummaries?: string[];
 	/**
-	 * Model-visible host tools kept alongside execute (extension tools that the
-	 * cell cannot replace: ask_user_question, advisor, subagent, …). One line
+	 * Resident host tools kept alongside execute (extension tools that the
+	 * cell cannot replace: ask_user_question, todo, load_tools, …). One line
 	 * each, name + first sentence. Empty/omitted → stock single-tool surface.
+	 * Tools the model activated through load_tools are not listed: they vary
+	 * per turn and the system prompt must stay stable for the cache.
 	 */
 	hostToolSummaries?: string[];
 	/**
@@ -156,9 +158,11 @@ function buildHostVisibleToolsSection(summaries: readonly string[]): string {
 	return [
 		"# Model-visible host tools",
 		"",
-		"Besides `execute`, these tools stay on the model tool list. Call them as normal top-level tools — not as `tools.*` inside a cell (the evaluator bridge only mounts the file builtins). Do not reimplement one inside a cell; their descriptions are in the tool schemas. A short task that one or two top-level tool calls can finish does not need a cell: call the tools directly.",
+		"Besides `execute`, these resident tools stay on the model tool list. Call them as normal top-level tools — not as `tools.*` inside a cell (the evaluator bridge only mounts the file builtins). Do not reimplement one inside a cell; their descriptions are in the tool schemas. A short task that one or two top-level tool calls can finish does not need a cell: call the tools directly.",
 		"",
 		names.join(", "),
+		"",
+		"Every other registered tool is inactive until you activate it with `load_tools` (by names, by group, or by keyword query; its description lists the catalog). Once activated, call it at the top level like the tools above.",
 	].join("\n");
 }
 

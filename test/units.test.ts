@@ -14,7 +14,16 @@ import { join } from "node:path";
 import { parseNpmSpecifier } from "../src/engine/npm.js";
 import { decodeMessage, encodeMessage } from "../src/engine/protocol.js";
 import { transformCell } from "../src/engine/transform.js";
-import { rlmCanTakeOver } from "../src/extension/keep-tools.js";
+import {
+	ALWAYS_RESIDENT_TOOLS,
+	DEFAULT_RESIDENT_TOOLS,
+	resolveRlmDropSet,
+	resolveRlmEnsuredSurface,
+	resolveRlmResidentSurface,
+	resolveRlmResidentTools,
+	rlmCanTakeOver,
+	sameToolSet,
+} from "../src/extension/keep-tools.js";
 import { buildRlmTsPrompt } from "../src/extension/prompt.js";
 import {
 	backgroundFor,
@@ -33,6 +42,14 @@ import {
 	MAX_SUBAGENT_NAME_LENGTH,
 	resolveDefaultSubagentModel,
 } from "../src/extension/subagents.js";
+import {
+	buildLoadToolsCatalog,
+	CATALOG_SUMMARY_CHARS,
+	QUERY_MATCH_LIMIT,
+	selectToolsToLoad,
+	summarizeForCatalog,
+	toolGroupName,
+} from "../src/extension/tool-tiers.js";
 
 // ── transform ─────────────────────────────────────────────────────────────────
 
@@ -489,6 +506,11 @@ describe("system prompt", () => {
 	test("short tasks go to top-level tools directly, long tasks to the process tool when present", () => {
 		const prompt = buildRlmTsPrompt({ cwd: "/tmp", hostToolSummaries: ["process — Manage background processes."] });
 		expect(prompt).toContain("one or two top-level tool calls can finish does not need a cell");
+		// The resident list is what the model sees; everything else must be
+		// reachable, and the prompt has to say how, or the model will reimplement
+		// a tool it cannot see inside a cell.
+		expect(prompt).toContain("resident tools");
+		expect(prompt).toContain("activate it with `load_tools`");
 		expect(prompt).toContain("If a `process` tool is on your tool list");
 		expect(prompt).toContain("wakes you on ready, error, or exit, so never sleep-poll");
 		expect(prompt).toContain("Without that tool, start the work detached (`Bun.spawn`");
@@ -851,6 +873,182 @@ describe("subagent host: validation", () => {
 
 	afterAll(() => {
 		for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+// ── tool tiers ────────────────────────────────────────────────────────────────
+
+describe("resident tier resolution", () => {
+	const registry = [
+		"execute",
+		"read",
+		"bash",
+		"rlm_mode",
+		"todo",
+		"ask_user_question",
+		"recall",
+		"model_list",
+		"advisor",
+		"compaction_continue_state",
+		"load_tools",
+	];
+
+	test("the default resident list is used when the env is unset, with execute and load_tools always present", () => {
+		const resident = resolveRlmResidentTools({});
+		expect(resident).toEqual([...DEFAULT_RESIDENT_TOOLS]);
+		for (const name of ALWAYS_RESIDENT_TOOLS) expect(resident).toContain(name);
+	});
+
+	test("PI_RLM_RESIDENT_TOOLS replaces the list but cannot remove execute or load_tools", () => {
+		expect(resolveRlmResidentTools({ PI_RLM_RESIDENT_TOOLS: "advisor, todo" })).toEqual([
+			"advisor",
+			"todo",
+			"execute",
+			"load_tools",
+		]);
+		expect(resolveRlmResidentTools({ PI_RLM_RESIDENT_TOOLS: "" })).toEqual([...ALWAYS_RESIDENT_TOOLS]);
+	});
+
+	test("the resident surface is resident ∩ registered − drop, execute first; unregistered names are ignored", () => {
+		const surface = resolveRlmResidentSurface(registry, { drop: resolveRlmDropSet({}) });
+		// `process`, `intercom`, `web_search`, `fetch_content` are configured but not registered here.
+		expect(surface).toEqual(["execute", "load_tools", "rlm_mode", "todo", "ask_user_question", "recall"]);
+	});
+
+	test("drop wins over resident for every tool except the forced pair", () => {
+		const drop = resolveRlmDropSet({ PI_RLM_DROP_TOOLS: "todo,execute,load_tools" });
+		const surface = resolveRlmResidentSurface(registry, { drop });
+		expect(surface).not.toContain("todo");
+		expect(surface).toContain("execute");
+		expect(surface).toContain("load_tools");
+	});
+
+	test("extra always names (rlm-toggle's rlm_mode) are forced even when not resident", () => {
+		const surface = resolveRlmResidentSurface(registry, {
+			drop: resolveRlmDropSet({}),
+			resident: ["todo"],
+			always: [...ALWAYS_RESIDENT_TOOLS, "rlm_mode"],
+		});
+		expect(surface).toEqual(["execute", "load_tools", "rlm_mode", "todo"]);
+	});
+
+	// Pi keeps deferred loading only while the active set grows, so the per-turn
+	// ensure must be a superset of what the model loaded, in the same order.
+	test("the ensured surface keeps loaded tools in place and appends missing resident ones", () => {
+		const drop = resolveRlmDropSet({});
+		const active = ["execute", "load_tools", "todo", "model_list", "advisor"];
+		const next = resolveRlmEnsuredSurface(active, registry, { drop });
+		expect(next.slice(0, active.length)).toEqual(active);
+		expect(next).toContain("ask_user_question");
+		expect(next).toContain("recall");
+	});
+
+	test("the ensured surface removes dropped, bridged, and unregistered names but never a resident one", () => {
+		const drop = resolveRlmDropSet({ PI_RLM_KEEP_BUILTINS: "1" });
+		const active = ["execute", "read", "compaction_continue_state", "gone_tool", "todo"];
+		const next = resolveRlmEnsuredSurface(active, registry, { drop });
+		expect(next).not.toContain("read");
+		expect(next).not.toContain("compaction_continue_state");
+		expect(next).not.toContain("gone_tool");
+		expect(next).toContain("todo");
+		// A bridged builtin the operator made resident survives the bridged filter.
+		const kept = resolveRlmEnsuredSurface(["execute", "read"], registry, { drop, resident: ["read"] });
+		expect(kept).toContain("read");
+	});
+
+	test("an unchanged surface compares equal regardless of order", () => {
+		expect(sameToolSet(["a", "b"], ["b", "a"])).toBe(true);
+		expect(sameToolSet(["a", "b"], ["a"])).toBe(false);
+		expect(sameToolSet(["a", "b"], ["a", "c"])).toBe(false);
+	});
+});
+
+describe("load_tools catalog", () => {
+	test("group names come from the package spec or, for generic sources, the extension file", () => {
+		expect(toolGroupName({ source: "builtin", path: "<builtin:grep>" })).toBe("builtin");
+		expect(toolGroupName({ source: "npm:pi-web-access", path: "/n/pi-web-access/dist/index.js" })).toBe(
+			"pi-web-access",
+		);
+		expect(toolGroupName({ source: "npm:@juicesharp/rpiv-todo", path: "/n/x/index.ts" })).toBe("rpiv-todo");
+		expect(toolGroupName({ source: "npm:@llamaindex/liteparse-pi-extension@latest", path: "/n/x.ts" })).toBe(
+			"liteparse-pi-extension",
+		);
+		expect(toolGroupName({ source: "git:github.com/justhil/pi-image-gen", path: "/g/index.ts" })).toBe("pi-image-gen");
+		expect(toolGroupName({ source: "https://github.com/catoncat/mcp-interactive-reader", path: "/g/e.ts" })).toBe(
+			"mcp-interactive-reader",
+		);
+		expect(toolGroupName({ source: "auto", path: "/home/u/.pi/agent/extensions/model-manager.ts" })).toBe(
+			"model-manager",
+		);
+		expect(toolGroupName({ source: "local", path: "/home/u/.pi/agent/extensions/herd/index.ts" })).toBe("herd");
+		expect(toolGroupName(undefined)).toBe("other");
+	});
+
+	test("a catalog line is the first sentence, whitespace collapsed, clipped to the budget", () => {
+		expect(summarizeForCatalog("List models. Use before switching.")).toBe("List models");
+		expect(summarizeForCatalog("Send a message\nto another\n\nsession.")).toBe("Send a message to another session");
+		const long = summarizeForCatalog(`${"word ".repeat(40)}end.`);
+		expect(long.length).toBeLessThanOrEqual(CATALOG_SUMMARY_CHARS);
+		expect(long.endsWith("…")).toBe(true);
+		expect(summarizeForCatalog(undefined)).toBe("");
+	});
+
+	test("the catalog groups tools under sorted source headers and stays within budget", () => {
+		const loadable = Array.from({ length: 30 }, (_, i) => ({
+			name: `tool_${String(i).padStart(2, "0")}`,
+			description: `${"Does something useful with a fairly long explanation ".repeat(3)}. More detail follows.`,
+			sourceInfo: { source: `npm:pkg-${i % 5}`, path: "/n/index.ts" },
+		}));
+		const catalog = buildLoadToolsCatalog(loadable);
+		const lines = catalog.split("\n");
+		expect(lines.filter((line) => line.endsWith(":"))).toEqual(["pkg-0:", "pkg-1:", "pkg-2:", "pkg-3:", "pkg-4:"]);
+		expect(lines).toHaveLength(35);
+		// Budget: about 30 tools in roughly 600 tokens at ~4 chars per token.
+		expect(catalog.length).toBeLessThanOrEqual(30 * (CATALOG_SUMMARY_CHARS + 20) + 5 * 8);
+		expect(buildLoadToolsCatalog([])).toBe("");
+	});
+});
+
+describe("load_tools selection", () => {
+	const loadable = [
+		{
+			name: "model_list",
+			description: "List all models.",
+			sourceInfo: { source: "auto", path: "/e/model-manager.ts" },
+		},
+		{ name: "model_switch", description: "Switch model.", sourceInfo: { source: "auto", path: "/e/model-manager.ts" } },
+		{ name: "advisor", description: "Escalate to a reviewer.", sourceInfo: { source: "npm:rpiv-advisor", path: "/n" } },
+		...Array.from({ length: 8 }, (_, i) => ({
+			name: `trail_${i}`,
+			description: "Herd trail memo action.",
+			sourceInfo: { source: "auto", path: "/e/herd-trail-tools.ts" },
+		})),
+	];
+
+	test("names split into added, already active, and unknown without throwing", () => {
+		const selection = selectToolsToLoad(
+			{ names: ["model_list", "todo", "nope", "model_list"] },
+			{ loadable, active: ["execute", "todo"] },
+		);
+		expect(selection).toEqual({ added: ["model_list"], alreadyActive: ["todo"], unknown: ["nope"], unmatched: [] });
+	});
+
+	test("group is matched case-insensitively and reports an empty group", () => {
+		expect(selectToolsToLoad({ group: "Model-Manager" }, { loadable, active: [] }).added).toEqual([
+			"model_list",
+			"model_switch",
+		]);
+		expect(selectToolsToLoad({ group: "nothing" }, { loadable, active: [] }).unmatched).toEqual(['group "nothing"']);
+	});
+
+	test("query scores name and description terms and caps the result", () => {
+		const byTerms = selectToolsToLoad({ query: "switch model" }, { loadable, active: [] });
+		expect(byTerms.added[0]).toBe("model_switch");
+		expect(byTerms.added).toContain("model_list");
+		expect(byTerms.added).not.toContain("advisor");
+		const capped = selectToolsToLoad({ query: "trail memo" }, { loadable, active: [] });
+		expect(capped.added).toHaveLength(QUERY_MATCH_LIMIT);
+		expect(selectToolsToLoad({ query: "zzz" }, { loadable, active: [] }).unmatched).toEqual(['query "zzz"']);
 	});
 });
 

@@ -3,20 +3,42 @@
  *
  * Primary LLM-facing tool: `execute`, running TypeScript in a persistent Bun
  * evaluator. File builtins are bridged as tools.* inside that evaluator.
- * Local keep-all (see keep-tools.ts) also leaves extension host tools
- * model-visible so session UI and delegation keep working under RLM.
+ * The rest of the surface is tiered (see keep-tools.ts): a resident set of
+ * host tools stays model-visible so session UI and delegation keep working
+ * under RLM, and `load_tools` activates any other registered tool on demand.
  */
 
 import { basename, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { EngineBusyError, EngineManager, type ExecuteResult } from "../engine/index.js";
-import { resolveRlmActiveTools, resolveRlmDropSet, rlmCanTakeOver, summarizeHostTool } from "./keep-tools.js";
+import {
+	resolveRlmDropSet,
+	resolveRlmEnsuredSurface,
+	resolveRlmResidentSurface,
+	resolveRlmResidentTools,
+	rlmCanTakeOver,
+	sameToolSet,
+	summarizeHostTool,
+} from "./keep-tools.js";
 import { createPiToolsHost, type PiToolsHost } from "./pi-tools.js";
 import { buildRlmTsPrompt, type RlmPromptModels, type RlmPromptSkill } from "./prompt.js";
 import { ExecuteCellComponent, type ExecuteDetails, type ExecuteRenderState, makeFrameSource } from "./render.js";
 import { classifyEngineFailure, EngineLifecycle, summarizeNames } from "./session-engine.js";
 import { createSubagentHost, resolveDefaultSubagentModel, type SubagentHost } from "./subagents.js";
+import {
+	buildLoadToolsCatalog,
+	buildLoadToolsDescription,
+	formatLoadToolsResult,
+	resolveLoadableTools,
+	selectToolsToLoad,
+} from "./tool-tiers.js";
+
+const loadToolsSchema = Type.Object({
+	names: Type.Optional(Type.Array(Type.String(), { description: "Exact tool names from the catalog." })),
+	group: Type.Optional(Type.String({ description: "A group header from the catalog; activates every tool in it." })),
+	query: Type.Optional(Type.String({ description: "Keywords matched against tool names and descriptions." })),
+});
 
 const executeSchema = Type.Object({
 	code: Type.String({
@@ -161,6 +183,49 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// The loader's description carries the catalog of loadable tools, so it can
+	// only be written once every extension has registered — which is why it is
+	// registered from session_start (as pi-fff registers its tools) rather than
+	// from this factory. Extensions that themselves register in session_start
+	// may still land after us, so the catalog is re-checked each turn and the
+	// tool re-registered (pi's registerTool overwrites by name and refreshes the
+	// registry) only when the loadable set actually changed: a changed schema
+	// invalidates the prompt cache, an unchanged one must not be touched.
+	let loadToolsCatalog: string | undefined;
+	const syncLoadTools = (): void => {
+		const all = pi.getAllTools();
+		const loadable = resolveLoadableTools(all, {
+			resident: resolveRlmResidentTools(),
+			drop: resolveRlmDropSet(),
+		});
+		const catalog = buildLoadToolsCatalog(loadable);
+		if (catalog === loadToolsCatalog && all.some((t) => t.name === "load_tools")) return;
+		loadToolsCatalog = catalog;
+		pi.registerTool({
+			name: "load_tools",
+			label: "load_tools",
+			description: buildLoadToolsDescription(catalog),
+			parameters: loadToolsSchema,
+			async execute(_toolCallId, params) {
+				if (params.names === undefined && params.group === undefined && params.query === undefined) {
+					throw new Error("load_tools needs at least one of names, group, or query.");
+				}
+				const selection = selectToolsToLoad(params, {
+					loadable: resolveLoadableTools(pi.getAllTools(), {
+						resident: resolveRlmResidentTools(),
+						drop: resolveRlmDropSet(),
+					}),
+					active: pi.getActiveTools(),
+				});
+				// Additive only: pi records the names added during this call on the
+				// tool result and serves them through deferred loading where the
+				// provider supports it. Removing anything here would forfeit that.
+				if (selection.added.length > 0) pi.setActiveTools([...pi.getActiveTools(), ...selection.added]);
+				return { content: [{ type: "text", text: formatLoadToolsResult(selection) }], details: selection };
+			},
+		});
+	};
+
 	// Replace pi's default prompt wholesale. It describes read, bash, and edit
 	// tools that this configuration does not register, and a prompt that
 	// advertises absent tools is worse than no prompt at all.
@@ -169,18 +234,26 @@ export default function (pi: ExtensionAPI) {
 		// tools it describes are actually registered in this configuration.
 		if (!active()) return undefined;
 		resolveModels(ctx);
-		// Re-assert keep-all each turn so later before_agent_start handlers that
-		// append themselves (ask_user_question, advisor) still see a full base,
-		// and so a mid-session setActiveTools collapse cannot stick.
+		syncLoadTools();
+		// Ensure, never reset: the resident tools are added back if a later
+		// handler or a mid-session collapse lost them, but anything the model
+		// activated through load_tools stays. Pi keeps deferred loading only
+		// while the active set grows; a removal here would fall back to sending
+		// the full list and break the cached prefix every turn. The unchanged
+		// case is skipped entirely so the tool list is not rebuilt for nothing.
 		const drop = resolveRlmDropSet();
+		const resident = resolveRlmResidentTools();
 		const all = pi.getAllTools();
-		const activeNames = resolveRlmActiveTools(
-			all.map((t) => t.name),
-			{ drop, always: ["execute"] },
-		);
-		pi.setActiveTools(activeNames);
+		const allNames = all.map((t) => t.name);
+		const current = pi.getActiveTools();
+		const next = resolveRlmEnsuredSurface(current, allNames, { drop, resident });
+		if (!sameToolSet(current, next)) pi.setActiveTools(next);
+		// The prompt names the resident tier only: loaded tools vary per turn and
+		// their descriptions already travel in the schema, while the system
+		// prompt must stay byte-stable for the cache.
+		const residentSurface = resolveRlmResidentSurface(allNames, { drop, resident });
 		const hostToolSummaries = all
-			.filter((t) => t.name !== "execute" && activeNames.includes(t.name))
+			.filter((t) => t.name !== "execute" && residentSurface.includes(t.name))
 			.map(summarizeHostTool);
 		// Everything pi resolved for this turn's prompt. Narrowing this cast to
 		// contextFiles alone is how skills went missing: pi loads them, offers
@@ -217,16 +290,19 @@ export default function (pi: ExtensionAPI) {
 		if (!active()) {
 			// registerTool ran at load (the flag was unreadable then), so a stock
 			// session must actively drop execute from the surface to stay stock.
-			pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "execute"));
+			// load_tools is only ever registered while active, but a session that
+			// toggled RLM off mid-way still has it and must lose it the same way.
+			pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "execute" && name !== "load_tools"));
 			return;
 		}
-		// Active: keep extension tools model-visible; drop bridged builtins
-		// (available as tools.* inside execute) plus a short extra exclude list.
-		const drop = resolveRlmDropSet();
+		// Active: shrink to the resident tier. This is the one non-additive
+		// call; everything else registered stays reachable through load_tools,
+		// whose catalog is built here, after every extension has registered.
+		syncLoadTools();
 		pi.setActiveTools(
-			resolveRlmActiveTools(
+			resolveRlmResidentSurface(
 				pi.getAllTools().map((t) => t.name),
-				{ drop, always: ["execute"] },
+				{ drop: resolveRlmDropSet(), resident: resolveRlmResidentTools() },
 			),
 		);
 		// A new session may run under different auth or a different model.
