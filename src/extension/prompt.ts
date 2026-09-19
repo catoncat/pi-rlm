@@ -92,7 +92,7 @@ const EVALUATOR_CONTROL_PROMPT = [
 	// wait timers that hit the wall clock (the largest residual hang class).
 	"Bun.$ parses its template itself, not through bash: escaped parens (\\( \\)), `$(...)` substitution, redirect chains, heredocs, and nested quoting fail with parse errors, and a dollar-brace inside the template is JS interpolation, not shell parameter expansion. When a command needs any of that, write it to a file with `Bun.write('/tmp/step.sh', script)` and run `Bun.$`bash /tmp/step.sh``.",
 	"",
-	"Each cell has a wall-clock limit (about 300 s, PI_RLM_CELL_TIMEOUT_MS); exceeding it kills the cell and restarts the evaluator. Never park a cell on a long sleep or poll loop, a headless `pi` run, a server, or a watcher: start such work detached (`Bun.spawn` with stdout to a log file, or `nohup … &` from a script), return immediately, and check the log or status in a later cell. Keep any single in-cell wait well under a minute.",
+	"Each cell has a wall-clock limit (about 300 s, PI_RLM_CELL_TIMEOUT_MS); exceeding it kills the cell and restarts the evaluator. Never park a cell on a long sleep or poll loop, a headless `pi` run, a server, or a watcher. If a `process` tool is on your tool list, run such work through it (start / output / stop): it manages background processes and wakes you on ready, error, or exit, so never sleep-poll for it. Without that tool, start the work detached (`Bun.spawn` with stdout to a log file, or `nohup … &` from a script), return immediately, and check the log or status in a later cell. Keep any single in-cell wait well under a minute.",
 	"",
 	"Do not install dependencies into the evaluator just to make an external project import or run there. If a project import, test, script, CLI, or dependency check is needed, run it through that project's own environment and normal command interface (its documented commands, package scripts, venv, etc.) and treat failures from that native environment as the relevant result.",
 	"",
@@ -120,6 +120,7 @@ function buildHostToolsSection(summaries: readonly string[]): string {
 		"Prefer `tools.edit({ path, edits: [{ oldText, newText }] })` over rewriting files with Bun.write: it fails loudly when an oldText is stale instead of silently reverting content you have not seen.",
 		"Prefer `tools.read({ path })` over `Bun.file(path).text()` for source files and anything that might be an image: it enforces size caps with continuation offsets and renders images so you can see them. Its `text` may end with bracketed reader notices; parse `raw` instead, which is the content alone.",
 		"`Bun.$` remains the way to run shell commands; `tools.bash` exists mainly for parity and timeouts.",
+		"`tools.call(name, args)` reaches only these seven bridged builtins (read, bash, edit, write, grep, find, ls). Extension tools are not bridged: call them at the top level.",
 	].join("\n");
 }
 
@@ -145,7 +146,7 @@ const SUBAGENT_GUIDANCE = [
 	"Fan in as values: parse, compare, and reduce the outputs in cells. When combining many long answers, a final synthesis child that reads the output files and writes one verdict is often better than merging prose yourself.",
 	"Use `await rlm.listSubagents()` to recover handles you lost. Delete a child with `await rlm.deleteSubagent(idOrName)` when it is no longer needed.",
 	"",
-	"`subagent` (host tool, when present) spawns a full peer session with a `contact_supervisor` escalation channel — use it for long-running workers that must escalate decisions; `rlm.run` is the lightweight fan-out path whose child only writes an output file and cannot escalate.",
+	"When `subagent` is on your tool list, delegate with it by default: it spawns a full peer session with a `contact_supervisor` escalation channel. Use `rlm.run` only for small pure-data tasks inside a cell, or when no `subagent` tool exists. An `rlm.run` child only writes an output file and cannot escalate; it is killed after 600 s by default (PI_RLM_SUBAGENT_TIMEOUT_MS) and by default cannot spawn children of its own (PI_RLM_MAX_DEPTH).",
 ].join("\n");
 
 function buildHostVisibleToolsSection(summaries: readonly string[]): string {
@@ -155,7 +156,7 @@ function buildHostVisibleToolsSection(summaries: readonly string[]): string {
 	return [
 		"# Model-visible host tools",
 		"",
-		"Besides `execute`, these tools stay on the model tool list. Call them as normal top-level tools — not as `tools.*` inside a cell (the evaluator bridge only mounts the file builtins). Do not reimplement one inside a cell; their descriptions are in the tool schemas.",
+		"Besides `execute`, these tools stay on the model tool list. Call them as normal top-level tools — not as `tools.*` inside a cell (the evaluator bridge only mounts the file builtins). Do not reimplement one inside a cell; their descriptions are in the tool schemas. A short task that one or two top-level tool calls can finish does not need a cell: call the tools directly.",
 		"",
 		names.join(", "),
 	].join("\n");

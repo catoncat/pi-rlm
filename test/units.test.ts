@@ -466,6 +466,34 @@ describe("system prompt", () => {
 		expect(without).not.toContain("Delegating to sub-agents");
 	});
 
+	// Measured in the 2026-09 session audit: rlm.run children fanned out into
+	// grandchildren and outlived a 600 s parent, while the peer `subagent` tool
+	// with its escalation channel sat unused. The prompt must state the choice
+	// and the two limits so the model does not learn them from a dead child.
+	test("delegation prefers the subagent tool and states rlm.run's limits", () => {
+		const prompt = buildRlmTsPrompt({ cwd: "/tmp", allowRecursion: true });
+		expect(prompt).toContain("When `subagent` is on your tool list, delegate with it by default");
+		expect(prompt).toContain("Use `rlm.run` only for small pure-data tasks inside a cell");
+		expect(prompt).toContain("600 s by default (PI_RLM_SUBAGENT_TIMEOUT_MS)");
+		expect(prompt).toContain("cannot spawn children of its own (PI_RLM_MAX_DEPTH)");
+	});
+
+	test("tools.call reach is stated as the seven bridged builtins", () => {
+		const prompt = buildRlmTsPrompt({ cwd: "/tmp", toolSummaries: ["tools.read({ path: string }) — Read a file."] });
+		expect(prompt).toContain(
+			"`tools.call(name, args)` reaches only these seven bridged builtins (read, bash, edit, write, grep, find, ls)",
+		);
+		expect(prompt).toContain("Extension tools are not bridged: call them at the top level");
+	});
+
+	test("short tasks go to top-level tools directly, long tasks to the process tool when present", () => {
+		const prompt = buildRlmTsPrompt({ cwd: "/tmp", hostToolSummaries: ["process — Manage background processes."] });
+		expect(prompt).toContain("one or two top-level tool calls can finish does not need a cell");
+		expect(prompt).toContain("If a `process` tool is on your tool list");
+		expect(prompt).toContain("wakes you on ready, error, or exit, so never sleep-poll");
+		expect(prompt).toContain("Without that tool, start the work detached (`Bun.spawn`");
+	});
+
 	test("child doctrine appears only at depth > 0", () => {
 		// "child agent" alone also appears in the subagent guidance; the doctrine's
 		// identity sentence is the distinctive marker.
@@ -512,6 +540,18 @@ describe("system prompt", () => {
 		const prompt = buildRlmTsPrompt({ cwd: "/tmp", depth: 1 });
 		expect(prompt).not.toContain("undefined");
 		expect(prompt).not.toMatch(/\$\{/);
+		// Every gated section rendered: a placeholder hiding in one of them would
+		// pass the bare-prompt check above.
+		const full = buildRlmTsPrompt({
+			cwd: "/tmp",
+			depth: 1,
+			allowRecursion: true,
+			toolSummaries: ["tools.read({ path: string }) — Read a file."],
+			hostToolSummaries: ["process — Manage background processes.", "subagent — Spawn a peer."],
+			models: { current: "a/c", subagentDefault: "a/b", available: ["a/b"] },
+		});
+		expect(full).not.toContain("undefined");
+		expect(full).not.toMatch(/\$\{/);
 	});
 });
 
