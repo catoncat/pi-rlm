@@ -147,6 +147,8 @@ function buildChildDoctrine(options: RlmPromptOptions): string | undefined {
 const SUBAGENT_GUIDANCE = [
 	"# Delegating to sub-agents",
 	"",
+	"Delegate through the top-level `subagent` tool by default: it spawns a full peer session with a `contact_supervisor` escalation channel. It is usually not on your tool list at first — activate it with `load_tools` (names: [\"subagent\"]) and call it next turn; never fall back to `rlm.run` merely because `subagent` is not visible. Use `rlm.run` only for small pure-data tasks inside a cell, or when `load_tools` reports that no `subagent` tool is registered. An `rlm.run` child only writes an output file and cannot escalate; it is killed after 600 s by default (PI_RLM_SUBAGENT_TIMEOUT_MS) and by default cannot spawn children of its own (PI_RLM_MAX_DEPTH).",
+	"",
 	"Fan out by default. When work decomposes into independent pieces — surveying a repository, reviewing several files or modules, checking N hypotheses, gathering sources, multi-perspective review — spawn one child per piece and let them run in parallel: wall time is the slowest child, not the sum. Doing decomposable work serially yourself is the exception, and it needs a reason (the pieces are trivial, or each step depends on the last).",
 	'Spawn with `const handle = await rlm.run("task prompt", { name: "api-reviewer" })`. This returns at admission, not completion — so spawn every independent child first, in one cell, before waiting on any of them. Keep handles in named variables.',
 	"Children start with no context: no conversation, no namespace, no idea what you are doing. Put everything the task needs into the prompt — concrete file paths, the question to answer, and the shape of answer you want back.",
@@ -156,8 +158,6 @@ const SUBAGENT_GUIDANCE = [
 	'Check each child\'s status before trusting its output: a child that ended "error" may have written nothing useful. Decide explicitly what a failed branch means for the task instead of silently synthesizing around it.',
 	"Fan in as values: parse, compare, and reduce the outputs in cells. When combining many long answers, a final synthesis child that reads the output files and writes one verdict is often better than merging prose yourself.",
 	"Use `await rlm.listSubagents()` to recover handles you lost. Delete a child with `await rlm.deleteSubagent(idOrName)` when it is no longer needed.",
-	"",
-	"When `subagent` is on your tool list, delegate with it by default: it spawns a full peer session with a `contact_supervisor` escalation channel. Use `rlm.run` only for small pure-data tasks inside a cell, or when no `subagent` tool exists. An `rlm.run` child only writes an output file and cannot escalate; it is killed after 600 s by default (PI_RLM_SUBAGENT_TIMEOUT_MS) and by default cannot spawn children of its own (PI_RLM_MAX_DEPTH).",
 ].join("\n");
 
 function buildHostVisibleToolsSection(summaries: readonly string[]): string {

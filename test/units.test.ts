@@ -503,7 +503,12 @@ describe("system prompt", () => {
 	// and the two limits so the model does not learn them from a dead child.
 	test("delegation prefers the subagent tool and states rlm.run's limits", () => {
 		const prompt = buildRlmTsPrompt({ cwd: "/tmp", allowRecursion: true });
-		expect(prompt).toContain("When `subagent` is on your tool list, delegate with it by default");
+		expect(prompt).toContain("Delegate through the top-level `subagent` tool by default");
+		// Under the tiered surface subagent is loadable, not resident: the prompt
+		// must send the model to load_tools instead of letting it drift to rlm.run
+		// (eval t08 on fable, posttiers run, 2026-09-20).
+		expect(prompt).toContain("activate it with `load_tools`");
+		expect(prompt).toContain("never fall back to `rlm.run` merely because");
 		expect(prompt).toContain("Use `rlm.run` only for small pure-data tasks inside a cell");
 		expect(prompt).toContain("600 s by default (PI_RLM_SUBAGENT_TIMEOUT_MS)");
 		expect(prompt).toContain("cannot spawn children of its own (PI_RLM_MAX_DEPTH)");
