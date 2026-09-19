@@ -268,7 +268,9 @@ export function createSubagentHost(options: SubagentHostOptions): SubagentHost {
 				throw new Error("rlm.run prompt must be a non-empty string");
 			}
 			if (options.depth + 1 > options.maxDepth) {
-				throw new Error(`rlm.run refused: recursion depth limit (${options.maxDepth}) reached`);
+				throw new Error(
+					`rlm.run refused: recursion depth limit (${options.maxDepth}) reached; use the top-level subagent tool or increase PI_RLM_MAX_DEPTH.`,
+				);
 			}
 			const kwargs = (payload.kwargs ?? {}) as Record<string, unknown>;
 			const requestedName = kwargs.name;

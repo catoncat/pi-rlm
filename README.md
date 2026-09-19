@@ -100,7 +100,7 @@ pi --rlm -e ./src/extension/index.ts
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PI_RLM_SUBAGENT_MODEL` | `anthropic/haiku` | Model children are spawned with |
-| `PI_RLM_MAX_DEPTH` | `2` | How deep recursive delegation may go |
+| `PI_RLM_MAX_DEPTH` | `1` | How deep recursive delegation may go |
 | `PI_RLM_DEPTH` | `0` | Depth of the current agent; set on children automatically |
 | `PI_RLM_NPM_CACHE_DIR` | `~/.cache/pi-rlm-npm` | Where `npm:` imports install |
 

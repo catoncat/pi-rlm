@@ -141,6 +141,8 @@ describe("subagent host", () => {
 		const r = await m.execute('await rlm.run("too deep");');
 		expect(r.status).toBe("error");
 		expect(r.error?.message).toContain("depth");
+		expect(r.error?.message).toContain("subagent");
+		expect(r.error?.message).toContain("PI_RLM_MAX_DEPTH");
 	});
 
 	test("delete_subagent kills a running child and removes it", async () => {

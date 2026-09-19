@@ -63,7 +63,8 @@ function composeErrorLines(error: { name: string; message: string; stack: string
 
 const SUBAGENT_MODEL_OVERRIDE = process.env.PI_RLM_SUBAGENT_MODEL;
 const DEPTH = Number(process.env.PI_RLM_DEPTH ?? "0");
-const MAX_DEPTH = Number(process.env.PI_RLM_MAX_DEPTH ?? "2");
+const configuredMaxDepth = Number(process.env.PI_RLM_MAX_DEPTH ?? "1");
+const MAX_DEPTH = Number.isInteger(configuredMaxDepth) && configuredMaxDepth >= 0 ? configuredMaxDepth : 1;
 /** Set by the parent's spawn: this agent's own id, linking its frames upward. */
 const SELF_CHILD_ID = process.env.PI_RLM_CHILD_ID;
 
