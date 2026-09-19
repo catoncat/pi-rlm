@@ -10,12 +10,12 @@
 import { basename, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { EngineBusyError, EngineManager } from "../engine/index.js";
+import { EngineBusyError, EngineManager, type ExecuteResult } from "../engine/index.js";
 import { resolveRlmActiveTools, resolveRlmDropSet, summarizeHostTool } from "./keep-tools.js";
 import { createPiToolsHost, type PiToolsHost } from "./pi-tools.js";
 import { buildRlmTsPrompt, type RlmPromptModels, type RlmPromptSkill } from "./prompt.js";
 import { ExecuteCellComponent, type ExecuteDetails, type ExecuteRenderState, makeFrameSource } from "./render.js";
-import { EngineLifecycle, summarizeNames } from "./session-engine.js";
+import { classifyEngineFailure, EngineLifecycle, summarizeNames } from "./session-engine.js";
 import { createSubagentHost, resolveDefaultSubagentModel, type SubagentHost } from "./subagents.js";
 
 const executeSchema = Type.Object({
@@ -306,11 +306,11 @@ export default function (pi: ExtensionAPI) {
 			// Building the engine here means the previous one went away mid-session;
 			// acquire revives it and arms the notice this cell will carry.
 			const { engine: m } = await lifecycle.acquire("cell");
-			try {
+			const runCell = (engine: EngineManager): Promise<ExecuteResult> => {
 				// Accumulate: partial updates must only ever grow, or the TUI row height
 				// oscillates with each replacing chunk (visible as jumping).
 				let streamed = "";
-				const r = await m.execute(params.code, {
+				return engine.execute(params.code, {
 					signal,
 					// One identity end to end: the transcript's toolCallId is the
 					// engine's cell id is the spawn_cell_id in frame records.
@@ -321,6 +321,41 @@ export default function (pi: ExtensionAPI) {
 						onUpdate?.({ content: [{ type: "text", text: streamed }], details: {} });
 					},
 				});
+			};
+			const deadEngineError = (error: unknown): Error => {
+				const message = error instanceof Error ? error.message : String(error);
+				return new Error(
+					`The evaluator process died while running this cell (${message.split("\n")[0]}). ` +
+						"It has been discarded; the next cell gets a fresh evaluator revived from the last completed snapshot, " +
+						"so anything newer than that snapshot is gone and variables must be re-verified before reuse. " +
+						"If this cell built a very large value, keep big data on disk (a file or SQLite) instead of the namespace.",
+				);
+			};
+			try {
+				let r: ExecuteResult;
+				try {
+					r = await runCell(m);
+				} catch (error) {
+					if (error instanceof EngineBusyError) throw error;
+					const kind = classifyEngineFailure(error);
+					if (kind === "other") throw error;
+					// The guest is gone either way; a dead engine left cached fails every
+					// later cell the same way (the pre-fix failure mode).
+					await lifecycle.discard();
+					if (kind === "dead-during-run") throw deadEngineError(error);
+					// dead-before-run: the guest died between cells (typically during the
+					// auto-snapshot), so this cell never ran. Rebuild, revive, and run it
+					// once on the fresh engine; acquire("cell") arms the reset notice.
+					const { engine: fresh } = await lifecycle.acquire("cell");
+					try {
+						r = await runCell(fresh);
+					} catch (retryError) {
+						if (retryError instanceof EngineBusyError) throw retryError;
+						if (classifyEngineFailure(retryError) === "other") throw retryError;
+						await lifecycle.discard();
+						throw deadEngineError(retryError);
+					}
+				}
 				// A reset notice leads, so the model reads that its namespace was
 				// rebuilt before it reads output produced against the rebuilt one.
 				// The session_start chat message is not enough: mid-work it scrolls
