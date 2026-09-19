@@ -217,11 +217,32 @@ describe("result shape", () => {
 		expect(plain.error?.message).not.toContain("top-level tool");
 	});
 
+	test("require errors explain the ESM import path", async () => {
+		const m = engine();
+		const r = await m.execute("require('node:path')");
+		expect(r.status).toBe("error");
+		expect(r.error?.message).toContain("ESM");
+		expect(r.error?.message).toContain("await import");
+		expect(r.error?.message).toContain("Bun API");
+		expect(r.error?.message).not.toContain("host tool");
+	});
+
 	test("syntax error is a normal error result, not a crash", async () => {
 		const m = engine();
 		const r = await m.execute("let let let");
 		expect(r.status).toBe("error");
 		expect((await m.execute("1+1")).result).toContain("2");
+	});
+
+	// `let let let` is a multi-error parse failure: Bun throws AggregateError
+	// with the bare message "Parse error". The agent must still see a position.
+	test("multi-error parse failure reaches the agent with position, not a bare Parse error", async () => {
+		const m = engine();
+		const r = await m.execute('console.log("He said "hello" to me")');
+		expect(r.status).toBe("error");
+		expect(r.error?.message).toContain("Cell did not compile");
+		expect(r.error?.message).toContain("line 1, column 23");
+		expect(r.error?.message).not.toMatch(/^Parse error$/m);
 	});
 });
 

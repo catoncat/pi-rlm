@@ -45,13 +45,22 @@ const transpiler = new Bun.Transpiler({ loader: "ts", deadCodeElimination: false
 
 // Bun.Transpiler throws BuildMessage objects whose stringified form drops the
 // position — an agent sees only `Expected "}" but found ":"` and retries the
-// same cell verbatim. Rebuild every compile failure into a compiler-style
-// display (message, position, offending line, caret) so the error is
-// actionable, and append a one-line hint for known traps.
+// same cell verbatim. When the parser recovers and reports several errors it
+// throws an AggregateError whose message is the bare "Parse error" and whose
+// `errors` array holds the BuildMessages — even less to act on. Rebuild every
+// compile failure into a compiler-style display (message, position, offending
+// line, caret) so the error is actionable, and append a one-line hint for
+// known traps.
 interface BuildPosition {
 	line: number;
 	column: number;
 	lineText: string;
+}
+
+interface BuildMessageLike {
+	name?: string;
+	message?: string;
+	position?: BuildPosition | null;
 }
 
 // Bash-style ${VAR:+x} written into a Bun.$`...` template literal is the one
@@ -68,24 +77,50 @@ function hintFor(lineText: string): string | undefined {
 	);
 }
 
+// Header for the first diagnostic; later ones in the same cascade are
+// "Also:" so the display reads as one failure with several sites rather than
+// several failures.
+function formatDiagnostic(item: BuildMessageLike, first: boolean): string[] {
+	// BuildMessage is not `instanceof Error`, but it does carry `.message`;
+	// String(item) would prefix the class name into the display.
+	const message = String(item.message ?? item);
+	const label = first ? "Cell did not compile:" : "Also:";
+	const position = item.position;
+	if (!position?.lineText) return [`${label} ${message}`];
+	return [
+		`${label} ${message} (line ${position.line}, column ${position.column})`,
+		"",
+		`  ${position.lineText}`,
+		`  ${" ".repeat(Math.max(0, position.column - 1))}^`,
+	];
+}
+
+function compileErrorFrom(error: unknown): SyntaxError | undefined {
+	const typed = error as BuildMessageLike & { errors?: unknown[] };
+	let items: BuildMessageLike[];
+	if (typed.name === "AggregateError" && Array.isArray(typed.errors) && typed.errors.length > 0) {
+		items = typed.errors as BuildMessageLike[];
+	} else if (typed.name === "BuildMessage" && typed.position?.lineText) {
+		items = [typed];
+	} else {
+		return undefined;
+	}
+	const blocks = items.map((item, index) => formatDiagnostic(item, index === 0).join("\n"));
+	// A cascade usually reports every site on the same line; one hint per
+	// distinct offending line, not one per diagnostic.
+	const hints = new Set<string>();
+	for (const item of items) {
+		const hint = item.position?.lineText ? hintFor(item.position.lineText) : undefined;
+		if (hint) hints.add(hint);
+	}
+	return new SyntaxError([...blocks, ...hints].join("\n\n"));
+}
+
 function transpileCell(code: string): string {
 	try {
 		return transpiler.transformSync(code);
 	} catch (error) {
-		const position = (error as { position?: BuildPosition | null }).position;
-		if ((error as Error).name !== "BuildMessage" || !position?.lineText) throw error;
-		// BuildMessage is not `instanceof Error`, but it does carry `.message`;
-		// String(error) would prefix the class name into the display.
-		const message = String((error as { message?: string }).message ?? error);
-		const lines = [
-			`Cell did not compile: ${message} (line ${position.line}, column ${position.column})`,
-			"",
-			`  ${position.lineText}`,
-			`  ${" ".repeat(Math.max(0, position.column - 1))}^`,
-		];
-		const hint = hintFor(position.lineText);
-		if (hint) lines.push("", hint);
-		throw new SyntaxError(lines.join("\n"));
+		throw compileErrorFrom(error) ?? error;
 	}
 }
 

@@ -431,6 +431,12 @@ function withHostToolHint(message: string): string {
 	if (!m) return message;
 	const [, viaTools, name] = m;
 	if (viaTools && (TOOL_NAMES as readonly string[]).includes(name)) return message;
+	// A bare `require(...)` fails the same way as a missing host tool, but it is
+	// never one: the guest is an ESM module, so the fix is an import, not a
+	// top-level tool call.
+	if (!viaTools && name === "require") {
+		return `${message}\nThe evaluator is ESM and has no require. Use import or await import(...) for modules, or a Bun API.`;
+	}
 	const hint = viaTools
 		? `tools.${name} is not mounted in the evaluator; only ${MOUNTED_TOOLS_TEXT} are. If ${name} is a model-visible host tool, call it as a top-level tool from the assistant turn, not from a cell.`
 		: `${name} is not defined in the evaluator. If it is a model-visible host tool, call it as a top-level tool from the assistant turn; cells only reach the bridged file tools as ${MOUNTED_TOOLS_TEXT}.`;

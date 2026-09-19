@@ -205,6 +205,27 @@ describe("transform: compile errors teach", () => {
 		expect(compileError("const x = ;")).not.toContain("interpolation");
 	});
 
+	// Once the parser recovers past the first error it throws AggregateError
+	// ("Parse error", no position) with the BuildMessages in `errors`. Mixed
+	// ASCII double quotes inside a string are the case seen in the wild.
+	test("a multi-error parse failure shows every site with position and caret", () => {
+		const message = compileError('console.log("He said "hello" to me")');
+		expect(message).not.toContain("Parse error");
+		expect(message).not.toContain("AggregateError");
+		expect(message).toContain('Cell did not compile: Expected ")" but found "hello" (line 1, column 23)');
+		expect(message).toContain("Also: ");
+		const lines = message.split("\n");
+		const sourceAt = lines.indexOf('  console.log("He said "hello" to me")');
+		expect(sourceAt).toBeGreaterThan(0);
+		expect(lines[sourceAt + 1]).toBe(`  ${" ".repeat(22)}^`);
+	});
+
+	test("a multi-error parse failure on a ${ line gets the bash hint once", () => {
+		const message = compileError("let let let ${VAR:+x}");
+		expect(message).toContain("line 1");
+		expect(message.split("interpolation")).toHaveLength(2);
+	});
+
 	test("valid JS interpolation compiles untouched", () => {
 		const { body } = transformCell("`${1 + 1}`");
 		expect(body).toContain("${1 + 1}");
