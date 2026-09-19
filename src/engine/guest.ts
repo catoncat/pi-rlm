@@ -107,8 +107,39 @@ const namespace: Namespace = Object.create(null);
 /** Monotonic cell counter; restored from the snapshot so ages span restarts. */
 let cellSeq = 0;
 const nameMeta = new Map<string, number>();
-const blobCache = new Map<string, { b64: string; serializedAt: number }>();
+/** `oversize` marks a value known to exceed the cap; it is not re-serialized until touched again. */
+const blobCache = new Map<string, { b64: string; serializedAt: number; oversize?: number }>();
 const deferredBlobs = new Map<string, { b64: string; touchedAt: number }>();
+
+// Snapshot size guard. A namespace holding a parsed 130 MB log produced a
+// 480 MB snapshot after every ok cell: serialize + base64 doubled the guest's
+// heap, the whole map crossed the fd-3 pipe as one line, and the host wrote
+// it synchronously. The guest died between cells and every later cell failed.
+// Values over the per-value cap, or past the total budget, are reported as
+// failed with a reason the reset notice can show; nothing else changes.
+const SNAPSHOT_MAX_VALUE_BYTES = resolveByteEnv("PI_RLM_SNAPSHOT_MAX_VALUE_BYTES", 16 * 1024 * 1024);
+const SNAPSHOT_MAX_TOTAL_BYTES = resolveByteEnv("PI_RLM_SNAPSHOT_MAX_TOTAL_BYTES", 64 * 1024 * 1024);
+
+/** Non-negative byte count from the environment; 0 disables the cap. */
+function resolveByteEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function formatMiB(bytes: number): string {
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+/** Serialized size of a cached blob, recovered from its base64 length. */
+function b64Bytes(b64: string): number {
+	return Math.floor((b64.length * 3) / 4);
+}
+
+function oversizeReason(bytes: number): string {
+	return `too large to snapshot (${formatMiB(bytes)} > ${formatMiB(SNAPSHOT_MAX_VALUE_BYTES)} cap; keep big data on disk or rlm.forget it)`;
+}
 
 function touchName(name: string): void {
 	nameMeta.set(name, cellSeq);
@@ -470,33 +501,62 @@ function snapshotNamespace(): {
 	const written: string[] = [];
 	const meta: Record<string, { touchedAt: number }> = {};
 	const failed: { name: string; reason: string }[] = [];
+	let totalBytes = 0;
+	// Deferred values were never deserialized; their blobs pass through intact
+	// with their original ages, so an unread value survives any number of
+	// snapshot/restore cycles. They count against the budget first: a revived
+	// value the agent has not touched must not be evicted by new work.
+	for (const [name, entry] of deferredBlobs) {
+		vars[name] = entry.b64;
+		meta[name] = { touchedAt: entry.touchedAt };
+		totalBytes += b64Bytes(entry.b64);
+	}
 	for (const [name, value] of Object.entries(namespace)) {
 		if (INTERNAL_BINDINGS.get(name) === value) continue;
 		const touchedAt = nameMeta.get(name) ?? cellSeq;
 		const cached = blobCache.get(name);
+		let b64: string;
+		if (cached && cached.serializedAt >= touchedAt && cached.oversize !== undefined) {
+			// Still the same oversized value: report it again without paying for
+			// another serialize pass.
+			failed.push({ name, reason: oversizeReason(cached.oversize) });
+			continue;
+		}
 		if (cached && cached.serializedAt >= touchedAt) {
 			// Untouched since it was last serialized — reuse the cached blob so
 			// snapshot cost tracks the live set, not the session's whole history.
-			vars[name] = cached.b64;
+			b64 = cached.b64;
 		} else {
+			let bytes: ArrayBufferLike;
 			try {
-				const b64 = Buffer.from(serialize(value)).toString("base64");
-				vars[name] = b64;
-				written.push(name);
-				blobCache.set(name, { b64, serializedAt: cellSeq });
+				bytes = serialize(value);
 			} catch (error) {
+				blobCache.delete(name);
 				failed.push({ name, reason: error instanceof Error ? error.message : String(error) });
 				continue;
 			}
+			if (SNAPSHOT_MAX_VALUE_BYTES > 0 && bytes.byteLength > SNAPSHOT_MAX_VALUE_BYTES) {
+				// Checked before base64 so an oversized value never costs the 4/3
+				// string on top of the buffer it already allocated.
+				blobCache.set(name, { b64: "", serializedAt: cellSeq, oversize: bytes.byteLength });
+				failed.push({ name, reason: oversizeReason(bytes.byteLength) });
+				continue;
+			}
+			b64 = Buffer.from(bytes).toString("base64");
+			written.push(name);
+			blobCache.set(name, { b64, serializedAt: cellSeq });
 		}
+		const size = b64Bytes(b64);
+		if (SNAPSHOT_MAX_TOTAL_BYTES > 0 && totalBytes + size > SNAPSHOT_MAX_TOTAL_BYTES) {
+			failed.push({
+				name,
+				reason: `snapshot budget exhausted (${formatMiB(SNAPSHOT_MAX_TOTAL_BYTES)} total; this value is ${formatMiB(size)})`,
+			});
+			continue;
+		}
+		totalBytes += size;
+		vars[name] = b64;
 		meta[name] = { touchedAt };
-	}
-	// Deferred values were never deserialized; their blobs pass through intact
-	// with their original ages, so an unread value survives any number of
-	// snapshot/restore cycles.
-	for (const [name, entry] of deferredBlobs) {
-		vars[name] = entry.b64;
-		meta[name] = { touchedAt: entry.touchedAt };
 	}
 	return { vars, written, meta, cellSeq, failed };
 }

@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EngineManager, type RestoreResult } from "../src/engine/index.js";
 import {
+	classifyEngineFailure,
 	EngineLifecycle,
 	formatEngineResetNotice,
 	type RevivableEngine,
@@ -286,6 +287,58 @@ describe("engine lifecycle hardening", () => {
 		expect(notice).toContain("nothing in it could be revived");
 		expect(notice).toContain("Failed to revive (2): edit, spawnSync");
 		expect(notice).not.toContain("no snapshot was available");
+	});
+});
+
+describe("dead engine recovery", () => {
+	// The guest can die between cells (auto-snapshot of an oversized namespace)
+	// or during one. Before this, the dead EngineManager stayed cached and every
+	// later cell failed with "Engine has been shut down" until pi was restarted.
+	test("a shutdown engine seen before the cell ran is retryable", () => {
+		expect(classifyEngineFailure(new Error("Engine has been shut down"))).toBe("dead-before-run");
+	});
+
+	test("a guest that died mid-cell is reported, not retried", () => {
+		expect(classifyEngineFailure(new Error("Engine process exited unexpectedly (code=null signal=SIGKILL)"))).toBe(
+			"dead-during-run",
+		);
+		expect(classifyEngineFailure(new Error("Engine process failed: spawn bun EACCES"))).toBe("dead-during-run");
+		expect(classifyEngineFailure(new Error("Engine guest did not become ready in time"))).toBe("dead-during-run");
+	});
+
+	test("ordinary cell errors are left alone", () => {
+		expect(classifyEngineFailure(new Error("TypeError: x is not a function"))).toBe("other");
+		expect(classifyEngineFailure("Engine has been shut down")).toBe("dead-before-run");
+		expect(classifyEngineFailure(new Error("the Engine has been shut down (not at start)"))).toBe("other");
+	});
+
+	test("a real engine killed between cells is classified as dead-before-run", async () => {
+		const engine = new EngineManager();
+		await engine.execute("1");
+		await engine.kill();
+		let caught: unknown;
+		await engine.execute("2").catch((error) => {
+			caught = error;
+		});
+		expect(classifyEngineFailure(caught)).toBe("dead-before-run");
+	});
+
+	test("the reset notice explains oversized omissions instead of asking for a redefinition", () => {
+		const notice = formatEngineResetNotice({
+			path: "/tmp/ns.snapshot",
+			restored: ["small"],
+			deferred: [],
+			failed: [
+				{
+					name: "EV",
+					reason: "too large to snapshot (310.2 MiB > 16.0 MiB cap; keep big data on disk or rlm.forget it)",
+				},
+				{ name: "helper", reason: "function" },
+			],
+		});
+		expect(notice).toContain("Lost (2): EV, helper");
+		expect(notice).toContain("Too large to snapshot: EV");
+		expect(notice).toContain("keep big data on disk");
 	});
 });
 

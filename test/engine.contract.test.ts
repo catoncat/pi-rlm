@@ -887,6 +887,51 @@ describe("snapshot/restore", () => {
 		expect((await m2.execute("good")).result).toContain("7");
 	});
 
+	test("oversized values are skipped with a reason, survive as a notice across restore, and are not re-serialized while untouched", async () => {
+		// A 130 MB parsed log in the namespace produced a 480 MB snapshot after
+		// every ok cell and killed the guest between cells. The cap turns that
+		// into a named, explained omission; small neighbours still persist.
+		const d = tempDir();
+		const snapshot = { path: join(d, "ns.snapshot") };
+		const env = { PI_RLM_SNAPSHOT_MAX_VALUE_BYTES: "4096", PI_RLM_SNAPSHOT_MAX_TOTAL_BYTES: "0" };
+		const m1 = engine({ snapshot, env });
+		await m1.execute('let small = 1; let huge = Array.from({ length: 5000 }, (_, i) => ({ i, s: "x".repeat(20) }));');
+		const snap1 = await m1.snapshotState();
+		expect(snap1?.saved).toContain("small");
+		expect(snap1?.saved).not.toContain("huge");
+		const reason = snap1?.failed.find((f) => f.name === "huge")?.reason ?? "";
+		expect(reason).toMatch(/too large to snapshot/);
+		expect(reason).toMatch(/keep big data on disk/);
+		// Untouched since: the second snapshot reports it again but writes nothing new for it.
+		await m1.execute("small = 2");
+		const snap2 = await m1.snapshotState();
+		expect(snap2?.written).toEqual(["small"]);
+		expect(snap2?.failed.map((f) => f.name)).toContain("huge");
+		await m1.kill();
+
+		// The fresh engine learns about the omission from the snapshot file, so the
+		// reset notice can name it instead of implying everything came back.
+		const m2 = engine({ snapshot, env });
+		await m2.start();
+		const restore = await m2.restoreState();
+		expect(restore?.restored).toContain("small");
+		expect(restore?.restored).not.toContain("huge");
+		expect(restore?.failed.find((f) => f.name === "huge")?.reason).toMatch(/too large/);
+		expect((await m2.execute("small")).result).toContain("2");
+	});
+
+	test("the total snapshot budget fails the value that would overflow it, not its neighbours", async () => {
+		const d = tempDir();
+		const snapshot = { path: join(d, "ns.snapshot") };
+		const env = { PI_RLM_SNAPSHOT_MAX_VALUE_BYTES: "0", PI_RLM_SNAPSHOT_MAX_TOTAL_BYTES: "2048" };
+		const m1 = engine({ snapshot, env });
+		await m1.execute('let a = 1; let big = "y".repeat(3000); let b = 2;');
+		const snap = await m1.snapshotState();
+		expect(snap?.saved).toEqual(expect.arrayContaining(["a", "b"]));
+		expect(snap?.saved).not.toContain("big");
+		expect(snap?.failed.find((f) => f.name === "big")?.reason).toMatch(/budget exhausted/);
+	});
+
 	test("restore-before-bootstrap: a snapshotted `rlm` impostor cannot shadow the live handle", async () => {
 		// Restoring happens before the runtime's own bindings are installed, so a
 		// stale value saved under an engine-owned name cannot shadow the live one.

@@ -90,11 +90,47 @@ export function formatEngineResetNotice(restore: RestoreResult | null): string {
 				)}`,
 				"Functions, classes, and live handles cannot be snapshotted; redefine them.",
 			);
+			const oversized = restore.failed.filter((f) => /too large|budget exhausted/.test(f.reason));
+			if (oversized.length > 0) {
+				// A value skipped for size is not a live handle; telling the agent to
+				// "redefine" it would rebuild the same oversized value and lose it again.
+				lines.push(
+					`Too large to snapshot: ${summarizeNames(
+						oversized.map((f) => f.name),
+						10,
+					)} — keep big data on disk (a file or SQLite) and load slices, instead of holding it in the namespace.`,
+				);
+			}
 		}
 		lines.push("Anything defined after the last snapshot is also gone.");
 	}
 	lines.push("Re-verify a variable before reusing it, especially inside shell interpolation.", "</rlm_engine_reset>");
 	return lines.join("\n");
+}
+
+/**
+ * How a cell failed, as far as recovery is concerned.
+ *
+ * `dead-before-run`: the engine was already shut down when the cell arrived —
+ * its guest died between cells (typically during the auto-snapshot), so the
+ * cell never ran and can be retried on a fresh engine with no side effects.
+ * `dead-during-run`: the guest died while this cell was executing; the cell
+ * may have had effects, so the caller discards the engine and reports rather
+ * than re-running. `other` is an ordinary cell error.
+ *
+ * Before this existed, a dead engine stayed cached for the rest of the
+ * session: every later cell failed with the same "Engine has been shut down"
+ * until the user restarted pi (78 such results across the local session logs).
+ */
+export type EngineFailureKind = "dead-before-run" | "dead-during-run" | "other";
+
+export function classifyEngineFailure(error: unknown): EngineFailureKind {
+	const message = error instanceof Error ? error.message : String(error);
+	if (/^Engine has been shut down/.test(message)) return "dead-before-run";
+	if (/^Engine process (exited unexpectedly|failed)|^Engine guest did not become ready/.test(message)) {
+		return "dead-during-run";
+	}
+	return "other";
 }
 
 export class EngineLifecycle<E extends RevivableEngine> {

@@ -912,6 +912,7 @@ export class EngineManager {
 				vars?: Record<string, string>;
 				meta?: Record<string, { touchedAt: number }>;
 				cellSeq?: number;
+				failed?: { name: string; reason: string }[];
 			};
 			// A v1 file has no ages; every value reads as just-touched and revives
 			// eagerly, which is exactly the old behaviour.
@@ -930,7 +931,19 @@ export class EngineManager {
 				SNAPSHOT_REQUEST_TIMEOUT_MS,
 			);
 			if (reply.type !== "restore_result") return null;
-			return { path: config.path, restored: reply.restored, deferred: reply.deferred, failed: reply.failed };
+			// Names the snapshot itself could not hold (unserializable, over the size
+			// cap) are absent from vars, so the guest never sees them. Without this
+			// merge they vanish from the reset notice and the agent reads "revived N"
+			// as "everything is back".
+			const failed = [...reply.failed];
+			const seen = new Set(failed.map((f) => f.name));
+			for (const f of payload.failed ?? []) {
+				if (f && typeof f.name === "string" && !seen.has(f.name)) {
+					seen.add(f.name);
+					failed.push({ name: f.name, reason: String(f.reason ?? "not in snapshot") });
+				}
+			}
+			return { path: config.path, restored: reply.restored, deferred: reply.deferred, failed };
 		} catch {
 			return null;
 		}
