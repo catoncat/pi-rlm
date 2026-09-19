@@ -361,11 +361,10 @@ const SHELL_PARSE_HINT =
 	"Write the command to a file with Bun.write('/tmp/step.sh', script) and run Bun.$`bash /tmp/step.sh` instead.";
 
 function withShellParseHint(error: unknown): unknown {
-	if (!(error instanceof Error) || error.message.includes(SHELL_PARSE_HINT)) return error;
-	const fromParser =
-		/^(Unexpected token|expected a command or assignment|Unexpected EOF|Unterminated)/i.test(error.message) ||
-		(error.stack ?? "").includes("BunShell");
-	if (!fromParser) return error;
+	// Every parser failure observed carries a native BunShell frame; the
+	// interpolation guard's own TypeError is thrown before Bun.$ runs, so it
+	// never reaches here.
+	if (!(error instanceof Error) || !(error.stack ?? "").includes("BunShell")) return error;
 	error.message = `${error.message}\n${SHELL_PARSE_HINT}`;
 	return error;
 }
