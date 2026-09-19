@@ -107,7 +107,8 @@ describe("subagent host", () => {
 			const m = new EngineManager({ hostHandlers: host.handlers });
 			managers.push(m);
 			await m.execute('await rlm.run("timeout me");');
-			for (let i = 0; i < 40 && host.entries()[0]?.status === "running"; i++) await new Promise((r) => setTimeout(r, 25));
+			for (let i = 0; i < 40 && host.entries()[0]?.status === "running"; i++)
+				await new Promise((r) => setTimeout(r, 25));
 			const entry = host.entries()[0];
 			expect(entry?.status).toBe("error");
 			expect(entry?.timed_out).toBe(true);
