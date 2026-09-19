@@ -11,7 +11,7 @@ import { basename, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { EngineBusyError, EngineManager, type ExecuteResult } from "../engine/index.js";
-import { resolveRlmActiveTools, resolveRlmDropSet, summarizeHostTool } from "./keep-tools.js";
+import { resolveRlmActiveTools, resolveRlmDropSet, rlmCanTakeOver, summarizeHostTool } from "./keep-tools.js";
 import { createPiToolsHost, type PiToolsHost } from "./pi-tools.js";
 import { buildRlmTsPrompt, type RlmPromptModels, type RlmPromptSkill } from "./prompt.js";
 import { ExecuteCellComponent, type ExecuteDetails, type ExecuteRenderState, makeFrameSource } from "./render.js";
@@ -76,7 +76,14 @@ export default function (pi: ExtensionAPI) {
 	// probe: getFlag is undefined here, true in every event), so activation is
 	// decided per event, never at load. PI_RLM_FORCE is the dev escape hatch:
 	// subagent children and test rigs activate without flag plumbing.
-	const active = () => pi.getFlag("rlm") === true || process.env.PI_RLM_FORCE === "1";
+	// Both are necessary: the flag says the operator wants RLM, the registry
+	// says pi actually exposes execute here (a launcher allowlist may not).
+	const requested = () => pi.getFlag("rlm") === true || process.env.PI_RLM_FORCE === "1";
+	const active = () =>
+		rlmCanTakeOver(
+			requested(),
+			pi.getAllTools().map((t) => t.name),
+		);
 
 	let subagents: SubagentHost | undefined;
 	let piTools: PiToolsHost | undefined;
@@ -300,7 +307,9 @@ export default function (pi: ExtensionAPI) {
 		},
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			if (!active()) {
-				throw new Error("pi-rlm is dormant in this session. Start pi with --rlm (or PI_RLM_FORCE=1) to use execute.");
+				throw new Error(
+					"pi-rlm is dormant in this session: RLM is off, or this session's tool allowlist excludes execute. Use the rlm_mode tool if present, or start pi with --rlm (or PI_RLM_FORCE=1).",
+				);
 			}
 			if (ctx?.cwd) location = { cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile?.() ?? undefined };
 			// Building the engine here means the previous one went away mid-session;

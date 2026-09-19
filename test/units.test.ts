@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { parseNpmSpecifier } from "../src/engine/npm.js";
 import { decodeMessage, encodeMessage } from "../src/engine/protocol.js";
 import { transformCell } from "../src/engine/transform.js";
+import { rlmCanTakeOver } from "../src/extension/keep-tools.js";
 import { buildRlmTsPrompt } from "../src/extension/prompt.js";
 import {
 	backgroundFor,
@@ -789,5 +790,17 @@ describe("subagent host: validation", () => {
 
 	afterAll(() => {
 		for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+describe("rlmCanTakeOver", () => {
+	test("needs both the request and a registered execute tool", () => {
+		expect(rlmCanTakeOver(true, ["execute", "ask_user_question"])).toBe(true);
+		expect(rlmCanTakeOver(false, ["execute"])).toBe(false);
+	});
+	test("a launcher allowlist without execute keeps pi-rlm dormant even under PI_RLM_FORCE", () => {
+		// pi-subagents' builtin worker: read, bash, … plus contact_supervisor; no execute.
+		const workerAllowlist = ["read", "bash", "edit", "write", "grep", "find", "ls", "contact_supervisor"];
+		expect(rlmCanTakeOver(true, workerAllowlist)).toBe(false);
 	});
 });

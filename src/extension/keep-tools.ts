@@ -69,6 +69,20 @@ export function resolveRlmActiveTools(
 	return out;
 }
 
+/**
+ * Whether pi-rlm may take over this session: the RLM flag/env alone is not
+ * enough, `execute` must actually be registered. A launcher's tool allowlist
+ * can exclude it — pi-subagents' builtin worker/delegate agents pass
+ * `read, bash, …, contact_supervisor` — while the child still inherits
+ * PI_RLM_FORCE=1 from an RLM parent. Taking over anyway replaced the prompt
+ * with one advertising a tool that does not exist and dropped the builtins
+ * it claimed were bridged, leaving the child with `contact_supervisor` alone
+ * (observed 2026-09-17: 16 of 21 background children in one day).
+ */
+export function rlmCanTakeOver(requested: boolean, allToolNames: readonly string[]): boolean {
+	return requested && allToolNames.includes("execute");
+}
+
 /** One-line summary for the system prompt; empty description → name only. */
 export function summarizeHostTool(tool: { name: string; description?: string }): string {
 	const desc = (tool.description ?? "").trim();
