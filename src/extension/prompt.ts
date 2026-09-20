@@ -31,6 +31,14 @@ export interface RlmPromptOptions {
 	messagesPath?: string;
 	depth?: number;
 	allowRecursion?: boolean;
+	/**
+	 * The bridge refuses `rlm.run` in this session (a top-level `subagent` tool
+	 * is registered; see subagents.ts rlmRunDisabledReason). The delegation
+	 * section then keeps only the route that works — the `subagent` tool via
+	 * `load_tools` — and drops every rlm.run mechanic, so the prompt never
+	 * teaches a call the bridge would refuse.
+	 */
+	rlmRunDisabled?: boolean;
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** One line per mounted evaluator tool (tools.*), from the bridge's own schemas. */
 	toolSummaries?: string[];
@@ -145,10 +153,20 @@ function buildChildDoctrine(options: RlmPromptOptions): string | undefined {
 	].join("\n");
 }
 
+/** The route that works everywhere: the peer `subagent` tool, activated through load_tools. */
+const SUBAGENT_TOOL_ROUTE =
+	'Delegate through the top-level `subagent` tool by default: it spawns a full peer session with a `contact_supervisor` escalation channel. It is usually not on your tool list at first — activate it with `load_tools` (names: ["subagent"]) and call it next turn';
+
+const SUBAGENT_TOOL_ONLY_GUIDANCE = [
+	"# Delegating to sub-agents",
+	"",
+	`${SUBAGENT_TOOL_ROUTE}. \`rlm.run\` is disabled in this session because that tool is registered.`,
+].join("\n");
+
 const SUBAGENT_GUIDANCE = [
 	"# Delegating to sub-agents",
 	"",
-	'Delegate through the top-level `subagent` tool by default: it spawns a full peer session with a `contact_supervisor` escalation channel. It is usually not on your tool list at first — activate it with `load_tools` (names: ["subagent"]) and call it next turn; never fall back to `rlm.run` merely because `subagent` is not visible. Use `rlm.run` only for small pure-data tasks inside a cell, or when `load_tools` reports that no `subagent` tool is registered. An `rlm.run` child only writes an output file and cannot escalate; it is killed after 600 s by default (PI_RLM_SUBAGENT_TIMEOUT_MS) and by default cannot spawn children of its own (PI_RLM_MAX_DEPTH).',
+	`${SUBAGENT_TOOL_ROUTE}; never fall back to \`rlm.run\` merely because \`subagent\` is not visible. Use \`rlm.run\` only for small pure-data tasks inside a cell, or when \`load_tools\` reports that no \`subagent\` tool is registered. An \`rlm.run\` child only writes an output file and cannot escalate; it is killed after 600 s by default (PI_RLM_SUBAGENT_TIMEOUT_MS) and by default cannot spawn children of its own (PI_RLM_MAX_DEPTH).`,
 	"",
 	"Fan out by default. When work decomposes into independent pieces — surveying a repository, reviewing several files or modules, checking N hypotheses, gathering sources, multi-perspective review — spawn one child per piece and let them run in parallel: wall time is the slowest child, not the sum. Doing decomposable work serially yourself is the exception, and it needs a reason (the pieces are trivial, or each step depends on the last).",
 	'Spawn with `const handle = await rlm.run("task prompt", { name: "api-reviewer" })`. This returns at admission, not completion — so spawn every independent child first, in one cell, before waiting on any of them. Keep handles in named variables.',
@@ -231,7 +249,9 @@ export function buildRlmTsPrompt(options: RlmPromptOptions): string {
 	const childDoctrine = buildChildDoctrine(options);
 	if (childDoctrine) parts.push("", childDoctrine);
 
-	if (allowRecursion) {
+	if (options.rlmRunDisabled) {
+		parts.push("", SUBAGENT_TOOL_ONLY_GUIDANCE);
+	} else if (allowRecursion) {
 		parts.push(
 			"",
 			"An `rlm` object is already in your evaluator namespace. `await rlm.run('sub-task')` spawns a child agent and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, `output_file`, and `model`; it never waits for or returns the child's answer.",

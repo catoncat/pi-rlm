@@ -25,7 +25,12 @@ import { createPiToolsHost, type PiToolsHost } from "./pi-tools.js";
 import { buildRlmTsPrompt, type RlmPromptModels, type RlmPromptSkill } from "./prompt.js";
 import { ExecuteCellComponent, type ExecuteDetails, type ExecuteRenderState, makeFrameSource } from "./render.js";
 import { classifyEngineFailure, EngineLifecycle, summarizeNames } from "./session-engine.js";
-import { createSubagentHost, resolveDefaultSubagentModel, type SubagentHost } from "./subagents.js";
+import {
+	createSubagentHost,
+	resolveDefaultSubagentModel,
+	rlmRunDisabledReason,
+	type SubagentHost,
+} from "./subagents.js";
 import {
 	buildLoadToolsCatalog,
 	buildLoadToolsDescription,
@@ -157,9 +162,21 @@ export default function (pi: ExtensionAPI) {
 				selfChildId: SELF_CHILD_ID,
 			});
 			piTools = createPiToolsHost({ cwd });
+			const spawnChild = subagents.handlers["rlm.run"]!;
 			return new EngineManager({
 				cwd,
-				hostHandlers: { ...subagents.handlers, ...piTools.handlers },
+				hostHandlers: {
+					...subagents.handlers,
+					// Decided per call, not per engine: a `subagent` tool registered by
+					// an extension that loads after this engine was built must still
+					// count, and it counts whether or not the model has activated it.
+					"rlm.run": async (payload, context) => {
+						const disabled = rlmRunDisabledReason(pi.getAllTools().map((t) => t.name));
+						if (disabled) throw new Error(disabled);
+						return spawnChild(payload, context);
+					},
+					...piTools.handlers,
+				},
 				// A snapshot is keyed to a session file; an ephemeral session has none
 				// to key it to, so its namespace lives and dies with the process.
 				snapshot: sessionKey ? { path: join(stateDir, "namespace.snapshot") } : undefined,
@@ -269,12 +286,16 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 		).systemPromptOptions;
+		// The same decision the rlm.run handler makes: the prompt must not teach
+		// a spawn call the bridge would refuse.
+		const rlmRunDisabled = rlmRunDisabledReason(allNames) !== undefined;
 		return {
 			systemPrompt: buildRlmTsPrompt({
 				cwd: ctx.cwd,
 				messagesPath: ctx.sessionManager.getSessionFile() ?? undefined,
 				depth: DEPTH,
-				allowRecursion: DEPTH < MAX_DEPTH,
+				allowRecursion: DEPTH < MAX_DEPTH && !rlmRunDisabled,
+				rlmRunDisabled,
 				contextFiles: options?.contextFiles,
 				skills: options?.skills,
 				// Fresh definitions for the prompt: signatures come from the same

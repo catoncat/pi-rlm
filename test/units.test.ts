@@ -41,6 +41,7 @@ import {
 	defaultSubagentName,
 	MAX_SUBAGENT_NAME_LENGTH,
 	resolveDefaultSubagentModel,
+	rlmRunDisabledReason,
 } from "../src/extension/subagents.js";
 import {
 	buildLoadToolsCatalog,
@@ -497,6 +498,35 @@ describe("system prompt", () => {
 		expect(without).not.toContain("Delegating to sub-agents");
 	});
 
+	// The environment pulls harder than the prompt: an `rlm` handle with a spawn
+	// call in every namespace was chosen over the peer `subagent` tool (eval t08).
+	// Where that tool is registered the bridge refuses rlm.run, and the prompt
+	// must match — keep the subagent route, drop every rlm.run mechanic.
+	test("with rlm.run disabled the prompt keeps the subagent route and drops the rlm.run mechanics", () => {
+		const disabled = buildRlmTsPrompt({
+			cwd: "/tmp",
+			allowRecursion: false,
+			rlmRunDisabled: true,
+			models: { current: "a/c", subagentDefault: "a/b", available: ["a/b"] },
+		});
+		expect(disabled).toContain("# Delegating to sub-agents");
+		expect(disabled).toContain("Delegate through the top-level `subagent` tool by default");
+		expect(disabled).toContain("activate it with `load_tools`");
+		expect(disabled).toContain("`rlm.run` is disabled in this session");
+		expect(disabled).not.toContain("An `rlm` object is already in your evaluator namespace");
+		expect(disabled).not.toContain("Spawn with `const handle = await rlm.run");
+		expect(disabled).not.toContain("Fan out by default");
+		expect(disabled).not.toContain("handle.output_file");
+		expect(disabled).not.toContain("Children default to");
+		// The namespace hygiene guidance is about rlm.forget, not rlm.run: it stays.
+		expect(disabled).toContain("rlm.forget(");
+
+		const enabled = buildRlmTsPrompt({ cwd: "/tmp", allowRecursion: true, rlmRunDisabled: false });
+		expect(enabled).toContain("An `rlm` object is already in your evaluator namespace");
+		expect(enabled).toContain("Spawn with `const handle = await rlm.run");
+		expect(enabled).not.toContain("`rlm.run` is disabled in this session");
+	});
+
 	// Measured in the 2026-09 session audit: rlm.run children fanned out into
 	// grandchildren and outlived a 600 s parent, while the peer `subagent` tool
 	// with its escalation channel sat unused. The prompt must state the choice
@@ -877,6 +907,15 @@ describe("subagent host: validation", () => {
 		const handle = await h.handlers["rlm.run"]({ prompt: "task", kwargs: { name: "by-name" } });
 		const deleted = await h.handlers["rlm.delete_subagent"]({ target: "by-name" });
 		expect((deleted.subagent as { rlm_child_id: string }).rlm_child_id).toBe(handle.rlm_child_id as string);
+	});
+
+	test("rlm.run is refused only while a subagent tool is registered, unless PI_RLM_ALLOW_RUN=1", () => {
+		const reason = rlmRunDisabledReason(["execute", "subagent", "todo"], {});
+		expect(reason).toContain("rlm.run is disabled");
+		expect(reason).toContain('load_tools({ names: ["subagent"] })');
+		expect(reason).toContain("PI_RLM_ALLOW_RUN");
+		expect(rlmRunDisabledReason(["execute", "todo"], {})).toBeUndefined();
+		expect(rlmRunDisabledReason(["execute", "subagent"], { PI_RLM_ALLOW_RUN: "1" })).toBeUndefined();
 	});
 
 	test("default names are slugged, bounded, and collision-resistant", () => {

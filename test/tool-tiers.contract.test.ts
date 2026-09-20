@@ -149,7 +149,7 @@ afterEach(async () => {
 
 // The extension reads its tiers from process.env; a developer's own shell (an
 // RLM session exporting PI_RLM_DROP_TOOLS) must not change what is asserted.
-const SURFACE_ENV = ["PI_RLM_DROP_TOOLS", "PI_RLM_RESIDENT_TOOLS", "PI_RLM_KEEP_BUILTINS"] as const;
+const SURFACE_ENV = ["PI_RLM_DROP_TOOLS", "PI_RLM_RESIDENT_TOOLS", "PI_RLM_KEEP_BUILTINS", "PI_RLM_ALLOW_RUN"] as const;
 const savedEnv = new Map<string, string | undefined>();
 beforeAll(() => {
 	for (const key of SURFACE_ENV) {
@@ -256,6 +256,46 @@ describe("tool surface: before_agent_start", () => {
 		expect(result.systemPrompt).toContain("todo, ask_user_question, load_tools");
 		expect(result.systemPrompt).toContain("activate it with `load_tools`");
 		expect(result.systemPrompt).not.toMatch(/^.*\badvisor\b.*$/m);
+	});
+
+	// The `rlm` handle is in every namespace, so the environment itself pulls the
+	// model toward rlm.run even where a peer `subagent` tool exists (eval t08).
+	// Registration alone — not activation — flips the decision, and the bridge
+	// and the prompt flip together.
+	test("a registered subagent tool disables rlm.run at the bridge and in the prompt", async () => {
+		const fake = await startSession([
+			...REGISTRY,
+			{ name: "subagent", description: "Spawn a peer session.", source: "npm:pi-subagents" },
+		]);
+		expect(fake.active).not.toContain("subagent");
+		const [result] = (await fake.emit(
+			"before_agent_start",
+			{ type: "before_agent_start", systemPromptOptions: {} },
+			fake.ctx(),
+		)) as Array<{ systemPrompt: string }>;
+		expect(result.systemPrompt).toContain("`rlm.run` is disabled in this session");
+		expect(result.systemPrompt).toContain("activate it with `load_tools`");
+		expect(result.systemPrompt).not.toContain("Spawn with `const handle = await rlm.run");
+		let thrown: unknown;
+		await fake.callTool("execute", { code: 'await rlm.run("delegate this")' }).catch((error) => {
+			thrown = error;
+		});
+		expect(String((thrown as Error | undefined)?.message)).toContain("rlm.run is disabled");
+		expect(String((thrown as Error | undefined)?.message)).toContain('load_tools({ names: ["subagent"] })');
+		// The rest of the handle is untouched.
+		const listed = await fake.callTool("execute", { code: "(await rlm.listSubagents()).subagents.length" });
+		expect(listed.content[0]?.text).toContain("0");
+	}, 20_000);
+
+	test("without a subagent tool the prompt teaches rlm.run", async () => {
+		const fake = await startSession();
+		const [result] = (await fake.emit(
+			"before_agent_start",
+			{ type: "before_agent_start", systemPromptOptions: {} },
+			fake.ctx(),
+		)) as Array<{ systemPrompt: string }>;
+		expect(result.systemPrompt).toContain("Spawn with `const handle = await rlm.run");
+		expect(result.systemPrompt).not.toContain("`rlm.run` is disabled in this session");
 	});
 
 	test("a tool registered after session start appears in the catalog on the next turn", async () => {

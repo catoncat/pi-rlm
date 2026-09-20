@@ -128,6 +128,32 @@ export interface SubagentHost {
 	killAll(): void;
 }
 
+/**
+ * Why `rlm.run` is refused in this session, or undefined when it may run.
+ *
+ * The `rlm` handle sits in every namespace, and an environment that offers a
+ * spawn call pulls the model toward it even when the prompt says otherwise
+ * (eval t08: rlm.run chosen over the peer `subagent` tool that has an
+ * escalation channel). Where a top-level `subagent` tool is registered —
+ * active or merely loadable — delegation belongs there, so the call is
+ * refused with the way out. The rest of the handle (listSubagents, forget)
+ * is untouched. PI_RLM_ALLOW_RUN=1 lifts the refusal for tests and
+ * development; the prompt reads the same decision so it never advertises a
+ * call that would be refused.
+ */
+export function rlmRunDisabledReason(
+	allToolNames: readonly string[],
+	env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+	if (env.PI_RLM_ALLOW_RUN === "1") return undefined;
+	if (!allToolNames.includes("subagent")) return undefined;
+	return (
+		"rlm.run is disabled here: the top-level subagent tool is registered — " +
+		'load it with load_tools({ names: ["subagent"] }) and delegate there. ' +
+		"(PI_RLM_ALLOW_RUN=1 re-enables rlm.run.)"
+	);
+}
+
 function resolveSubagentTimeoutMs(): number {
 	const raw = process.env.PI_RLM_SUBAGENT_TIMEOUT_MS;
 	if (raw === undefined || raw === "") return 600_000; // 10 minutes
