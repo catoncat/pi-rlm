@@ -20,6 +20,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { type ActivityEntry, ActivityLog, describeToolTarget, exitCodeFromBashError } from "./activity.js";
 import {
 	decodeMessage,
 	encodeMessage,
@@ -92,12 +93,19 @@ export interface ExecuteResult {
 	resultTruncated?: boolean;
 	/** True when the shared stdout+stderr+result budget was exhausted. */
 	outputLimitReached?: boolean;
+	/**
+	 * What the cell touched: bridged tools.* calls and Bun.$ commands, in order.
+	 * Renderer-only — the model-visible text is stdout/stderr/result alone.
+	 */
+	activity?: ActivityEntry[];
 }
 
 export interface ExecuteOptions {
 	/** Aborting cancels the cell cooperatively; namespace is preserved. */
 	signal?: AbortSignal;
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
+	/** Fires with the whole trail so far each time the cell touches something; lets a live view keep up. */
+	onActivity?: (activity: ActivityEntry[]) => void;
 	/** Cap stdout / stderr / result at this many characters. Default 65536. */
 	maxOutputChars?: number;
 	/**
@@ -221,6 +229,7 @@ interface ActiveExecution {
 	abortRequested: boolean;
 	/** Aborts host-side work done on this cell's behalf (bridged tool calls). */
 	hostAbort: AbortController;
+	activity: ActivityLog;
 	resolve(result: ExecuteResult): void;
 	reject(error: Error): void;
 }
@@ -522,6 +531,17 @@ export class EngineManager {
 				this.appendOutput(active, message.name, message.chunk);
 				break;
 			}
+			case "shell_trace": {
+				this.recordActivity(message.cellId, {
+					kind: "shell",
+					name: "bash",
+					target: message.command,
+					ok: message.exitCode === 0,
+					exitCode: message.exitCode,
+					durationMs: message.durationMs,
+				});
+				break;
+			}
 			case "done": {
 				const active = this.activeExecution;
 				if (!active || active.settled || active.cellId !== message.cellId) return;
@@ -622,8 +642,33 @@ export class EngineManager {
 				errorMessage: message,
 			};
 		} finally {
-			this.appendDispatchLog(cellId, requestType, outcome, Date.now() - started);
+			const durationMs = Date.now() - started;
+			this.appendDispatchLog(cellId, requestType, outcome, durationMs);
+			if (requestType === "tools.call") {
+				const name = typeof payload.name === "string" && payload.name !== "" ? payload.name : "call";
+				this.recordActivity(cellId, {
+					kind: "tool",
+					name,
+					target: describeToolTarget(name, payload.args, this.options.cwd ?? process.cwd()),
+					ok: outcome.status === "ok",
+					durationMs,
+					exitCode:
+						name === "bash" && outcome.status === "error" ? exitCodeFromBashError(outcome.errorMessage) : undefined,
+				});
+			}
 		}
+	}
+
+	/**
+	 * Same attribution rule as output: only the cell that issued the action, and
+	 * only while it is live. A late trace from a cancelled cell's continuation
+	 * would otherwise land on whichever cell is running now.
+	 */
+	private recordActivity(cellId: string, entry: ActivityEntry): void {
+		const active = this.activeExecution;
+		if (!active || active.settled || active.abortRequested || active.cellId !== cellId) return;
+		active.activity.push(entry);
+		active.opts.onActivity?.(active.activity.snapshot());
 	}
 
 	/** One durable JSONL line per bridged host request, DSH dispatch-ledger style. */
@@ -763,6 +808,7 @@ export class EngineManager {
 				settled: false,
 				abortRequested: false,
 				hostAbort: new AbortController(),
+				activity: new ActivityLog(),
 				resolve,
 				reject,
 			};
@@ -874,6 +920,7 @@ export class EngineManager {
 			stderrTruncated: active.stderrTruncated,
 			resultTruncated,
 			outputLimitReached: active.stdoutTruncated || active.stderrTruncated || resultTruncated,
+			activity: active.activity.isEmpty ? undefined : active.activity.snapshot(),
 		});
 	}
 

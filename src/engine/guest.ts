@@ -27,6 +27,7 @@ import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import { createInterface } from "node:readline";
 import { format } from "node:util";
+import { clipCommand } from "./activity.js";
 import { importNpm } from "./npm.js";
 import { PRELUDE_MODULES, type PreludeModule } from "./prelude.js";
 import {
@@ -473,6 +474,10 @@ class BashShellPromise implements PromiseLike<ShellResult> {
 	}
 
 	private async spawn(): Promise<ShellResult> {
+		// Attribution is fixed at start: the command belongs to the cell that
+		// built it even if it finishes after that cell was cancelled.
+		const owner = (cellStorage.getStore() ?? activeCell)?.cellId ?? "";
+		const started = Date.now();
 		// stdin is ignored for the same reason the guest's own is /dev/null: a
 		// child that reads stdin must see EOF, not hang on a pipe nobody closes.
 		const proc = Bun.spawn([BASH_PATH, "-c", this.command], {
@@ -498,6 +503,13 @@ class BashShellPromise implements PromiseLike<ShellResult> {
 			collect(proc.stderr, "stderr"),
 			proc.exited,
 		]);
+		send({
+			type: "shell_trace",
+			cellId: owner,
+			command: clipCommand(this.command),
+			exitCode: exited,
+			durationMs: Date.now() - started,
+		});
 		const result = makeShellResult(stdout, stderr, exited);
 		if (this.throwOnFailure && exited !== 0) throw new ShellError(this.command, result);
 		return result;

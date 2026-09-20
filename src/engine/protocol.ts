@@ -47,6 +47,13 @@ export type HostToGuestMessage = HostToGuest[keyof HostToGuest];
 export interface GuestToHost {
 	ready: { type: "ready" };
 	stream: { type: "stream"; cellId: string; name: "stdout" | "stderr"; chunk: string };
+	/**
+	 * One Bun.$ command finished. Its own message rather than a stream chunk
+	 * because stream text is cell output the model reads; this is renderer-only
+	 * bookkeeping, and it must never widen what the model sees. `command` is
+	 * already clipped guest-side so a heredoc does not cross the pipe twice.
+	 */
+	shell_trace: { type: "shell_trace"; cellId: string; command: string; exitCode: number; durationMs: number };
 	done: {
 		type: "done";
 		cellId: string;
