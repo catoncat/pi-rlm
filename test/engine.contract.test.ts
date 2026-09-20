@@ -191,17 +191,20 @@ describe("result shape", () => {
 		expect(r2.result).toContain("123");
 	});
 
-	test("a Bun.$ parse error carries the write-a-script hint, once", async () => {
+	// Bun's native `$` rejected this template ("expected a command or assignment
+	// but got: Redirect"); the audit counted 232 such cells. The guarantee is now
+	// the opposite: bash syntax simply works, and a genuine bash syntax error
+	// surfaces as bash's own exit 2 with its stderr in the message.
+	test("a redirect chain runs through bash; a real bash syntax error reports exit 2 with stderr", async () => {
 		const m = engine();
-		const r = await m.execute("await Bun.$`ls > /tmp/x 2>&1 | head`.quiet();");
-		expect(r.status).toBe("error");
-		expect(r.error?.message).toContain("Redirect");
-		expect(r.error?.message).toContain("bash /tmp/step.sh");
-		expect(r.error?.message.split("bash /tmp/step.sh")).toHaveLength(2);
-		// Ordinary shell failures (non-zero exit) are not parse errors and get no hint.
-		const r2 = await m.execute("await Bun.$`exit 3`.quiet();");
+		const d = tempDir();
+		const r = await m.execute(`await Bun.$\`ls > ${d}/x 2>&1 | head\`.quiet(); "ran"`);
+		expect(r.status).toBe("ok");
+		expect(r.result).toContain("ran");
+		const r2 = await m.execute("await Bun.$`echo (`.quiet();");
 		expect(r2.status).toBe("error");
-		expect(r2.error?.message).not.toContain("bash /tmp/step.sh");
+		expect(r2.error?.message).toContain("exit code 2");
+		expect(r2.error?.message).toContain("syntax error");
 	});
 
 	test("calling a host tool from a cell, bare or as tools.*, says where it lives", async () => {
@@ -266,6 +269,72 @@ describe("shell", () => {
 		expect(r.status).toBe("ok");
 		// macOS tmpdir may resolve through /private
 		expect(r.result?.includes(d) || r.result?.includes(join("/private", d))).toBe(true);
+	});
+
+	// The model writes bash; the template is executed by bash. Bun's own shell
+	// grammar rejected every one of these forms with a parse error.
+	test("heredocs, $(...) substitution, and bash conditionals run as written", async () => {
+		const m = engine();
+		const heredoc = await m.execute("(await Bun.$`cat <<'EOF'\nfrom heredoc\nEOF`.quiet()).text()");
+		expect(heredoc.status).toBe("ok");
+		expect(heredoc.result).toContain("from heredoc");
+		const substitution = await m.execute("(await Bun.$`echo outer-$(echo inner)`.quiet()).text().trim()");
+		expect(substitution.result).toContain("outer-inner");
+		const conditional = await m.execute("(await Bun.$`if (( 2 > 1 )); then echo yes; fi`.quiet()).text().trim()");
+		expect(conditional.result).toContain("yes");
+	});
+
+	// An interpolated value is data, not shell text: spaces and `$` inside it
+	// must reach the command as one argument, verbatim. Arrays spread into one
+	// argument each, and `{ raw }` is the explicit escape hatch for shell text.
+	test("interpolations are single escaped arguments; arrays spread; { raw } splices verbatim", async () => {
+		const m = engine();
+		const single = await m.execute("const v = 'a b $HOME'; (await Bun.$`printf '<%s>' ${v}`.quiet()).text()");
+		expect(single.status).toBe("ok");
+		expect(single.result).toContain("<a b $HOME>");
+		const array = await m.execute("(await Bun.$`printf '<%s>' ${['x y', 'z']}`.quiet()).text()");
+		expect(array.result).toContain("<x y><z>");
+		const raw = await m.execute("(await Bun.$`echo ${{ raw: 'one two | wc -w' }}`.quiet()).text().trim()");
+		expect(raw.result).toContain("2");
+	});
+
+	// Bun's contract for failure: a non-zero exit throws unless `.nothrow()`.
+	// The thrown error carries the exit code and stderr, because with `.quiet()`
+	// nothing else would show the model why the command failed.
+	test("non-zero exit throws with exitCode and stderr; .nothrow() returns it instead", async () => {
+		const m = engine();
+		const thrown = await m.execute("await Bun.$`echo why-it-failed >&2; exit 3`.quiet()");
+		expect(thrown.status).toBe("error");
+		expect(thrown.error?.message).toContain("exit code 3");
+		expect(thrown.error?.message).toContain("why-it-failed");
+		const caught = await m.execute(
+			"let shellErr; try { await Bun.$`exit 4`.quiet(); } catch (e) { shellErr = e; } `${shellErr.exitCode}:${typeof shellErr.stderr.toString}`",
+		);
+		expect(caught.result).toContain("4:function");
+		const tolerated = await m.execute("(await Bun.$`echo partial; exit 5`.quiet().nothrow()).exitCode");
+		expect(tolerated.status).toBe("ok");
+		expect(tolerated.result).toBe("5");
+	});
+
+	test("quiet suppresses the echo; a non-quiet command echoes stdout and stderr into the cell", async () => {
+		const m = engine();
+		const quiet = await m.execute("await Bun.$`echo silent-out; echo silent-err >&2`.quiet(); 1");
+		expect(quiet.stdout).not.toContain("silent-out");
+		expect(quiet.stderr).not.toContain("silent-err");
+		const loud = await m.execute("await Bun.$`echo loud-out; echo loud-err >&2`; 1");
+		expect(loud.stdout).toContain("loud-out");
+		expect(loud.stderr).toContain("loud-err");
+	});
+
+	test(".cwd() and .env() apply to that command; .text() and .json() read its stdout", async () => {
+		const d = tempDir();
+		const m = engine();
+		const cwd = await m.execute(`(await Bun.$\`pwd\`.quiet().cwd(${JSON.stringify(d)})).text().trim()`);
+		expect(cwd.result?.includes(d) || cwd.result?.includes(join("/private", d))).toBe(true);
+		const env = await m.execute("await Bun.$`echo $RLM_PROBE`.quiet().env({ RLM_PROBE: 'from-env' }).text()");
+		expect(env.result).toContain("from-env");
+		const json = await m.execute("(await Bun.$`echo '{\"n\":41}'`.quiet().json()).n + 1");
+		expect(json.result).toBe("42");
 	});
 });
 

@@ -316,64 +316,198 @@ function hostRequest(requestType: string, payload: Record<string, unknown> = {})
 	});
 }
 
-/**
- * Bun.$ interpolates values into the command string, and `String(undefined)` is
- * the literal text "undefined". A single stale variable therefore turns
- * `rm -rf ${dir}` into `rm -rf undefined` — a command that runs, succeeds, and
- * operates on entirely the wrong path. The shell cannot distinguish a missing
- * value from one that is genuinely the word "undefined", so it is refused here,
- * before the command is ever built.
- */
-function guardShellInterpolation(shell: typeof Bun.$): typeof Bun.$ {
-	return new Proxy(shell, {
-		apply(target, thisArg, args: unknown[]) {
-			const [strings, ...values] = args as [TemplateStringsArray, ...unknown[]];
-			for (let i = 0; i < values.length; i++) {
-				if (values[i] === null || values[i] === undefined) {
-					const preceding = (strings?.[i] ?? "").trimStart().slice(-40);
-					const where = preceding ? ` (after "…${preceding}")` : "";
-					throw new TypeError(
-						`Bun.$ interpolation #${i + 1}${where} is ${values[i] === null ? "null" : "undefined"}. ` +
-							`It would be interpolated as the literal text "${String(values[i])}", producing a command that runs ` +
-							"against the wrong target. Check the value before using it in a shell command.",
-					);
-				}
-			}
-			try {
-				return Reflect.apply(target as (...a: unknown[]) => unknown, thisArg, args);
-			} catch (error) {
-				throw withShellParseHint(error);
-			}
-		},
-	});
+// ── Bun.$ over bash ──────────────────────────────────────────────────────────
+// The model writes bash. Bun's native `$` parses its template with its own
+// shell grammar instead: heredocs, `$(...)`, redirect chains and escaped parens
+// all fail to parse (232 cells in 113 sessions in the 2026-09 audit, mostly
+// followed by blind re-quoting). So the `Bun.$` a cell reaches is this tagged
+// template: it builds one command string — interpolations escaped with Bun's
+// own `$.escape` so a value with spaces or `$` stays a single argument — and
+// hands the whole thing to `bash -c`. The call shape stays Bun's so nothing the
+// model already knows (`.quiet()`, `.nothrow()`, `.text()`, `out.exitCode`)
+// changes.
+
+/** Saved before the namespace shadows Bun: it is the one native piece still used. */
+const NATIVE_SHELL_ESCAPE: (text: string) => string = Bun.$.escape;
+/** Absolute so a `.env({...})` without PATH can still find the shell. */
+const BASH_PATH = Bun.which("bash") ?? "/bin/bash";
+
+function isShellRaw(value: unknown): value is { raw: string } {
+	return typeof value === "object" && value !== null && typeof (value as { raw?: unknown }).raw === "string";
 }
 
 /**
- * Bun.$ parses its template with its own shell grammar, synchronously, at the
- * call. Its parse errors name the token but not the way out ("Unexpected
- * token: `(`", "expected a command or assignment but got: \"Redirect\""),
- * and the 2026-09 session audit counted 232 such cells in 113 sessions, mostly
- * followed by blind re-quoting. Append the way out, once, like transform.ts
- * does for compile errors.
+ * One interpolation → shell text. `String(undefined)` is the literal word
+ * "undefined", so a stale variable would turn `rm -rf ${dir}` into `rm -rf
+ * undefined` — a command that runs, succeeds, and hits the wrong path. The
+ * shell cannot tell that from a genuine "undefined", so nullish is refused
+ * here, before the command is built.
  */
-const SHELL_PARSE_HINT =
-	"Bun.$ parsed this template with its own shell grammar, not bash: escaped parens, redirect chains, heredocs and nested quoting are not supported. " +
-	"Write the command to a file with Bun.write('/tmp/step.sh', script) and run Bun.$`bash /tmp/step.sh` instead.";
-
-function withShellParseHint(error: unknown): unknown {
-	// Every parser failure observed carries a native BunShell frame; the
-	// interpolation guard's own TypeError is thrown before Bun.$ runs, so it
-	// never reaches here.
-	if (!(error instanceof Error) || !(error.stack ?? "").includes("BunShell")) return error;
-	error.message = `${error.message}\n${SHELL_PARSE_HINT}`;
-	return error;
+function shellInterpolation(value: unknown, index: number, preceding: string): string {
+	if (value === null || value === undefined) {
+		const tail = preceding.trimStart().slice(-40);
+		const where = tail ? ` (after "…${tail}")` : "";
+		throw new TypeError(
+			`Bun.$ interpolation #${index + 1}${where} is ${value === null ? "null" : "undefined"}. ` +
+				`It would be interpolated as the literal text "${String(value)}", producing a command that runs ` +
+				"against the wrong target. Check the value before using it in a shell command.",
+		);
+	}
+	if (isShellRaw(value)) return value.raw;
+	if (Array.isArray(value)) {
+		return value.map((item) => (isShellRaw(item) ? item.raw : NATIVE_SHELL_ESCAPE(String(item)))).join(" ");
+	}
+	return NATIVE_SHELL_ESCAPE(String(value));
 }
 
-const GUARDED_SHELL = guardShellInterpolation(Bun.$);
+function buildShellCommand(strings: TemplateStringsArray, values: unknown[]): string {
+	let command = strings[0] ?? "";
+	for (let i = 0; i < values.length; i++) {
+		command += shellInterpolation(values[i], i, strings[i] ?? "") + (strings[i + 1] ?? "");
+	}
+	return command;
+}
+
+interface ShellResult {
+	stdout: Buffer;
+	stderr: Buffer;
+	exitCode: number;
+	text(encoding?: BufferEncoding): string;
+	json(): unknown;
+	lines(): string[];
+}
+
+function makeShellResult(stdout: Buffer, stderr: Buffer, exitCode: number): ShellResult {
+	return {
+		stdout,
+		stderr,
+		exitCode,
+		text: (encoding: BufferEncoding = "utf8") => stdout.toString(encoding),
+		json: () => JSON.parse(stdout.toString("utf8")),
+		lines: () => stdout.toString("utf8").replace(/\n$/, "").split("\n"),
+	};
+}
+
+class ShellError extends Error {
+	readonly exitCode: number;
+	readonly stdout: Buffer;
+	readonly stderr: Buffer;
+	constructor(command: string, result: ShellResult) {
+		// The tail of stderr travels in the message: with `.quiet()` nothing else
+		// shows the model why the command failed. bash's own syntax errors arrive
+		// this way too (exit 2, "syntax error near unexpected token").
+		const tail = result.stderr.toString("utf8").trimEnd().slice(-600);
+		super(`Failed with exit code ${result.exitCode}: ${command}${tail ? `\n${tail}` : ""}`);
+		this.name = "ShellError";
+		this.exitCode = result.exitCode;
+		this.stdout = result.stdout;
+		this.stderr = result.stderr;
+	}
+}
+
+/**
+ * Same shape as Bun's ShellPromise: awaitable, with chainable configuration.
+ * The command starts on the first `then` (or `.text()` etc.), so `.cwd()` and
+ * `.env()` can follow the template like they do in Bun. Default cwd and env
+ * are read at start, so `process.chdir()` and `process.env.X = ...` in an
+ * earlier cell apply to later commands — the persistence route the prompt
+ * teaches.
+ */
+class BashShellPromise implements PromiseLike<ShellResult> {
+	private quietMode = false;
+	private throwOnFailure = true;
+	private workingDirectory?: string;
+	private environment?: Record<string, string | undefined>;
+	private started?: Promise<ShellResult>;
+
+	constructor(private readonly command: string) {}
+
+	quiet(): this {
+		this.quietMode = true;
+		return this;
+	}
+	nothrow(): this {
+		this.throwOnFailure = false;
+		return this;
+	}
+	cwd(dir: string): this {
+		this.workingDirectory = dir;
+		return this;
+	}
+	env(vars: Record<string, string | undefined>): this {
+		this.environment = vars;
+		return this;
+	}
+	async text(encoding?: BufferEncoding): Promise<string> {
+		return (await this.run()).text(encoding);
+	}
+	async json(): Promise<unknown> {
+		return (await this.run()).json();
+	}
+	async *lines(): AsyncGenerator<string> {
+		for (const line of (await this.run()).lines()) yield line;
+	}
+	// biome-ignore lint/suspicious/noThenProperty: awaitable by design, like Bun's ShellPromise
+	then<TResult1 = ShellResult, TResult2 = never>(
+		onfulfilled?: ((value: ShellResult) => TResult1 | PromiseLike<TResult1>) | null,
+		onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+	): Promise<TResult1 | TResult2> {
+		return this.run().then(onfulfilled, onrejected);
+	}
+	catch<TResult = never>(
+		onrejected?: ((reason: unknown) => TResult | PromiseLike<TResult>) | null,
+	): Promise<ShellResult | TResult> {
+		return this.run().catch(onrejected);
+	}
+	finally(onfinally?: (() => void) | null): Promise<ShellResult> {
+		return this.run().finally(onfinally);
+	}
+
+	private run(): Promise<ShellResult> {
+		if (!this.started) this.started = this.spawn();
+		return this.started;
+	}
+
+	private async spawn(): Promise<ShellResult> {
+		// stdin is ignored for the same reason the guest's own is /dev/null: a
+		// child that reads stdin must see EOF, not hang on a pipe nobody closes.
+		const proc = Bun.spawn([BASH_PATH, "-c", this.command], {
+			cwd: this.workingDirectory ?? process.cwd(),
+			env: this.environment ?? process.env,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const quiet = this.quietMode;
+		const collect = async (stream: ReadableStream<Uint8Array>, name: "stdout" | "stderr"): Promise<Buffer> => {
+			const chunks: Uint8Array[] = [];
+			for await (const chunk of stream) {
+				chunks.push(chunk);
+				// Bun's `$` echoes a non-quiet command's output as it arrives; emit()
+				// does the same while attributing it to the calling cell.
+				if (!quiet) emit(name, Buffer.from(chunk).toString("utf8"));
+			}
+			return Buffer.concat(chunks);
+		};
+		const [stdout, stderr, exited] = await Promise.all([
+			collect(proc.stdout, "stdout"),
+			collect(proc.stderr, "stderr"),
+			proc.exited,
+		]);
+		const result = makeShellResult(stdout, stderr, exited);
+		if (this.throwOnFailure && exited !== 0) throw new ShellError(this.command, result);
+		return result;
+	}
+}
+
+function bashShell(strings: TemplateStringsArray, ...values: unknown[]): BashShellPromise {
+	return new BashShellPromise(buildShellCommand(strings, values));
+}
+bashShell.escape = NATIVE_SHELL_ESCAPE;
 
 const GUARDED_BUN = new Proxy(Bun, {
 	get(target, key) {
-		if (key === "$") return GUARDED_SHELL;
+		if (key === "$") return bashShell;
 		// Bind the receiver to the real Bun so its methods keep their own `this`.
 		return Reflect.get(target, key, target);
 	},
@@ -477,7 +611,7 @@ function installBootstrapBindings(): void {
 	namespace.rlm = RLM_HANDLE;
 	INTERNAL_BINDINGS.set("rlm", RLM_HANDLE);
 	// Cells resolve `Bun` through the namespace, so this shadows the global with
-	// a version whose shell refuses nullish interpolation.
+	// a version whose `$` runs through bash and refuses nullish interpolation.
 	namespace.Bun = GUARDED_BUN;
 	INTERNAL_BINDINGS.set("Bun", GUARDED_BUN);
 	namespace.tools = TOOLS_HANDLE;
