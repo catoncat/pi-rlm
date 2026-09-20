@@ -62,6 +62,9 @@ export const DEFAULT_RESIDENT_TOOLS = [
 	"fetch_content",
 	"web_search",
 	"process",
+	"loop_start",
+	"loop_end",
+	"loop_wait",
 	"load_tools",
 ] as const;
 
