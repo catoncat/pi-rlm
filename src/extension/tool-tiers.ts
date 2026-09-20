@@ -192,3 +192,18 @@ export function formatLoadToolsResult(selection: LoadToolsSelection): string {
 	}
 	return lines.join("\n") || "Nothing to activate.";
 }
+
+/**
+ * A model that calls a loadable tool before loading it gets pi's immediate
+ * "Tool X not found" (decided before any hook can intervene). Recognise that
+ * shape so the extension can activate X on the spot: the retry then succeeds
+ * without a load_tools round trip. Returns the tool name, or undefined.
+ */
+export function notFoundToolName(toolName: string, result: unknown, isError: boolean): string | undefined {
+	if (!isError) return undefined;
+	const blocks = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content ?? [];
+	const text = blocks.map((b) => (b.type === "text" ? (b.text ?? "") : "")).join("\n");
+	const match = /^Tool (\S+) not found\b/.exec(text.trim());
+	if (!match) return undefined;
+	return match[1] === toolName ? toolName : undefined;
+}

@@ -59,6 +59,7 @@ import {
 import {
 	buildLoadToolsCatalog,
 	CATALOG_SUMMARY_CHARS,
+	notFoundToolName,
 	QUERY_MATCH_LIMIT,
 	selectToolsToLoad,
 	summarizeForCatalog,
@@ -1382,5 +1383,17 @@ describe("rlmCanTakeOver", () => {
 		// pi-subagents' builtin worker: read, bash, … plus contact_supervisor; no execute.
 		const workerAllowlist = ["read", "bash", "edit", "write", "grep", "find", "ls", "contact_supervisor"];
 		expect(rlmCanTakeOver(true, workerAllowlist)).toBe(false);
+	});
+});
+
+describe("notFoundToolName", () => {
+	const err = (text: string) => ({ content: [{ type: "text", text }] });
+	test("recognises pi's immediate not-found result for the same tool", () => {
+		expect(notFoundToolName("subagent", err("Tool subagent not found"), true)).toBe("subagent");
+	});
+	test("ignores successes, other errors and mismatched names", () => {
+		expect(notFoundToolName("subagent", err("Tool subagent not found"), false)).toBeUndefined();
+		expect(notFoundToolName("subagent", err("Tool budget exceeded"), true)).toBeUndefined();
+		expect(notFoundToolName("subagent", err("Tool recall not found"), true)).toBeUndefined();
 	});
 });

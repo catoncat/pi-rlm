@@ -36,6 +36,7 @@ import {
 	buildLoadToolsCatalog,
 	buildLoadToolsDescription,
 	formatLoadToolsResult,
+	notFoundToolName,
 	resolveLoadableTools,
 	selectToolsToLoad,
 } from "./tool-tiers.js";
@@ -357,6 +358,25 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		await lifecycle.shutdown();
+	});
+
+	// The model called a loadable tool without load_tools first. Pi already
+	// answered "Tool X not found" (that path runs before any hook), but the
+	// intent is unambiguous: activate X now so the retry works, additively, the
+	// same way load_tools would have. Nothing is activated for unknown names.
+	pi.on("tool_execution_end", async (event, ctx) => {
+		if (!active()) return;
+		const name = notFoundToolName(event.toolName, event.result, event.isError);
+		if (!name) return;
+		const loadable = resolveLoadableTools(pi.getAllTools(), {
+			resident: resolveRlmResidentTools(),
+			drop: resolveRlmDropSet(),
+		});
+		if (!loadable.some((t) => t.name === name) || pi.getActiveTools().includes(name)) return;
+		pi.setActiveTools([...pi.getActiveTools(), name]);
+		try {
+			ctx.ui?.notify?.(`已按需激活工具 ${name}（模型直接调用了未加载的工具）`, "info");
+		} catch {}
 	});
 
 	pi.on("tool_result", async (event) => {
