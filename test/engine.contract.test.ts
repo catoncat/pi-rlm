@@ -961,6 +961,105 @@ describe("host bridge", () => {
 	});
 });
 
+// ── 9b. Activity trail ────────────────────────────────────────────────────────
+// A cell that reads three files, edits two, and runs a command is one
+// collapsed block in the transcript. The trail records what it touched so the
+// renderer can show it — and only the renderer: the text the model reads is
+// stdout, stderr, and the result, exactly as before.
+
+describe("activity trail", () => {
+	const toolsHost = (cwd: string) => ({
+		"tools.call": async (payload: Record<string, unknown>) => {
+			const args = payload.args as Record<string, unknown>;
+			if (payload.name === "edit" && args.path === "missing.ts") throw new Error("File not found");
+			if (payload.name === "bash") throw new Error("boom\n\nCommand exited with code 3");
+			return { text: `${payload.name} ok in ${cwd}`, images: 0, details: null };
+		},
+	});
+
+	test("tools.* calls and Bun.$ commands are recorded in order with target, outcome, and exit code", async () => {
+		const cwd = tempDir();
+		const m = engine({ cwd, hostHandlers: toolsHost(cwd) });
+		const r = await m.execute(
+			[
+				'await tools.read({ path: "src/a.ts" });',
+				`await tools.edit({ path: ${JSON.stringify(join(cwd, "src/a.ts"))}, edits: [] });`,
+				'await tools.edit({ path: "missing.ts", edits: [] }).catch(() => {});',
+				'await tools.grep({ pattern: "TODO" });',
+				"await Bun.$`echo trail-shell`.quiet();",
+				"await Bun.$`exit 2`.quiet().nothrow();",
+				'await tools.bash({ command: "exit 3" }).catch(() => {});',
+				'"trail-result"',
+			].join("\n"),
+		);
+		expect(r.status).toBe("ok");
+		expect(r.activity?.map((e) => [e.kind, e.name, e.target, e.ok, e.exitCode])).toEqual([
+			["tool", "read", "src/a.ts", true, undefined],
+			// An absolute path inside cwd displays relative to it.
+			["tool", "edit", "src/a.ts", true, undefined],
+			["tool", "edit", "missing.ts", false, undefined],
+			["tool", "grep", "TODO", true, undefined],
+			["shell", "bash", "echo trail-shell", true, 0],
+			["shell", "bash", "exit 2", false, 2],
+			["tool", "bash", "exit 3", false, 3],
+		]);
+		for (const entry of r.activity ?? []) expect(typeof entry.durationMs).toBe("number");
+		// Zero model-visible cost: nothing the trail knows leaks into the text.
+		expect(r.stdout).toBe("");
+		expect(r.stderr).toBe("");
+		expect(r.result).toBe('"trail-result"');
+	});
+
+	test("a cell that touches nothing has no trail", async () => {
+		const m = engine();
+		const r = await m.execute("1 + 1");
+		expect(r.activity).toBeUndefined();
+	});
+
+	// Following along is the point: the trail must be observable while the cell
+	// is still running, not only in the settled result.
+	test("onActivity fires with the trail so far before the cell finishes", async () => {
+		const cwd = tempDir();
+		const m = engine({ cwd, hostHandlers: toolsHost(cwd) });
+		const seen: Array<{ atMs: number; targets: string[] }> = [];
+		const t0 = Date.now();
+		const r = await m.execute(
+			'await tools.read({ path: "a.ts" }); await new Promise((r) => setTimeout(r, 600)); await tools.read({ path: "b.ts" });',
+			{ onActivity: (trail) => seen.push({ atMs: Date.now() - t0, targets: trail.map((e) => e.target ?? "") }) },
+		);
+		expect(r.status).toBe("ok");
+		expect(seen).toHaveLength(2);
+		expect(seen[0]!.atMs).toBeLessThan(500);
+		// Each call carries the whole trail, so a consumer never has to merge.
+		expect(seen[0]!.targets).toEqual(["a.ts"]);
+		expect(seen[1]!.targets).toEqual(["a.ts", "b.ts"]);
+	});
+
+	test("the trail caps at 40 entries and reports the overflow as one +N more tail", async () => {
+		const cwd = tempDir();
+		const m = engine({ cwd, hostHandlers: toolsHost(cwd) });
+		const r = await m.execute("for (let i = 0; i < 45; i++) await tools.read({ path: `f${i}.ts` });");
+		expect(r.status).toBe("ok");
+		expect(r.activity).toHaveLength(41);
+		expect(r.activity?.[39]?.target).toBe("f39.ts");
+		expect(r.activity?.[40]).toMatchObject({ name: "…", target: "+5 more" });
+	});
+
+	// Same rule as output: an action belongs to the cell that took it, and a
+	// cancelled cell's continuation cannot write its late actions onto the next.
+	test("a shell command finishing after its cell was cancelled is not attributed to the next cell", async () => {
+		const m = engine();
+		const ac = new AbortController();
+		const cancelled = m.execute("await Bun.$`sleep 1.2; echo late`.quiet();", { signal: ac.signal });
+		await new Promise((r) => setTimeout(r, 200));
+		ac.abort();
+		expect((await cancelled).status).toBe("aborted");
+		const next = await m.execute("await new Promise((r) => setTimeout(r, 1500)); 'clean'");
+		expect(next.status).toBe("ok");
+		expect(next.activity).toBeUndefined();
+	}, 10_000);
+});
+
 // ── 10. Snapshot / restore ────────────────────────────────────────────────────
 // Persistence is best-effort per variable, and honest about it: whatever cannot
 // be serialised is named rather than silently dropped, so an agent resuming a

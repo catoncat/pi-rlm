@@ -15,7 +15,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -322,4 +322,45 @@ describe("tool surface: before_agent_start", () => {
 		expect(fake.tools.get("load_tools")?.tool.description).toContain("fff_find — Fuzzy find files");
 		expect(fake.active).toContain("fff_find");
 	});
+});
+
+// The activity trail is for the person watching the transcript, not the
+// model: it rides the result's details (and every partial update) into the
+// renderer, while the content the model reads stays stdout/stderr/result.
+describe("execute result: activity trail", () => {
+	test("the trail is in details and partial updates, never in the model-visible content", async () => {
+		const fake = await startSession();
+		writeFileSync(join(cwd, "note.txt"), "alpha\n");
+		const updates: Array<{ text: string; activity?: unknown[] }> = [];
+		const result = (await fake.tools.get("execute")!.tool.execute(
+			"call-execute",
+			{
+				code: [
+					'await tools.read({ path: "note.txt" });',
+					'await tools.edit({ path: "note.txt", edits: [{ oldText: "alpha", newText: "beta" }] });',
+					"await Bun.$`echo shell-line`;",
+					'"trail-done"',
+				].join("\n"),
+			},
+			undefined,
+			(update: { content: Array<{ type: string; text?: string }>; details?: { activity?: unknown[] } }) =>
+				updates.push({ text: update.content[0]?.text ?? "", activity: update.details?.activity }),
+			fake.ctx(),
+		)) as { content: Array<{ type: string; text?: string }>; details: { activity?: Array<{ name: string }> } };
+		// What the model sees: the echoed shell output and the result, nothing else.
+		const text = result.content.map((block) => block.text ?? "").join("\n");
+		expect(text).toBe('shell-line\n\n"trail-done"');
+		expect(text).not.toContain("note.txt");
+		expect(text).not.toContain("read");
+		// What the renderer sees.
+		expect(result.details.activity?.map((entry) => entry.name)).toEqual(["read", "edit", "bash"]);
+		// Live: the read was reported before the cell finished, and later
+		// updates (the streamed echo) still carry the trail rather than dropping it.
+		expect(updates[0]?.activity?.length).toBe(1);
+		const streamed = updates.find((update) => update.text.includes("shell-line"));
+		expect(streamed?.activity?.length).toBeGreaterThanOrEqual(2);
+		for (let i = 1; i < updates.length; i++) {
+			expect(updates[i]!.activity?.length ?? 0).toBeGreaterThanOrEqual(updates[i - 1]!.activity?.length ?? 0);
+		}
+	}, 20_000);
 });

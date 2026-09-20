@@ -11,9 +11,19 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	ACTIVITY_COMMAND_CHARS,
+	type ActivityEntry,
+	ActivityLog,
+	clipCommand,
+	describeToolTarget,
+	displayPath,
+	exitCodeFromBashError,
+	MAX_ACTIVITY_ENTRIES,
+} from "../src/engine/activity.js";
 import { parseNpmSpecifier } from "../src/engine/npm.js";
 import { PRELUDE_MODULES } from "../src/engine/prelude.js";
-import { decodeMessage, encodeMessage } from "../src/engine/protocol.js";
+import { decodeMessage, encodeMessage, type GuestToHost } from "../src/engine/protocol.js";
 import { transformCell } from "../src/engine/transform.js";
 import {
 	ALWAYS_RESIDENT_TOOLS,
@@ -30,7 +40,9 @@ import {
 	backgroundFor,
 	closeOpenSgr,
 	type ExecuteRenderState,
+	formatActivitySummary,
 	formatDuration,
+	groupActivity,
 	isShellish,
 	paintBackground,
 	type RenderDeps,
@@ -327,6 +339,80 @@ describe("protocol framing", () => {
 		expect(decodeMessage(JSON.stringify({ __rlm: 1 }))).toBeNull();
 		expect(decodeMessage(JSON.stringify({ __rlm: 2, type: "done" }))).toBeNull();
 		expect(decodeMessage("")).toBeNull();
+	});
+
+	// The shell trace is its own message type, not a stream chunk: stream text
+	// is cell output the model reads, and the trace must never widen that.
+	test("a shell_trace round-trips under the nonce with its command, exit code, and duration intact", () => {
+		const trace: GuestToHost["shell_trace"] = {
+			type: "shell_trace",
+			cellId: "cell-7",
+			command: "git status --short",
+			exitCode: 0,
+			durationMs: 42,
+		};
+		const line = encodeMessage(trace, "nonce-a");
+		expect(decodeMessage<Record<string, unknown>>(line, "nonce-a")).toEqual({ ...trace, __rlm: 1, n: "nonce-a" });
+		expect(decodeMessage(line, "nonce-b")).toBeNull();
+	});
+});
+
+// ── activity trail ────────────────────────────────────────────────────────────────
+
+describe("activity trail", () => {
+	test("each bridged tool names its target: paths relative to cwd, patterns as given, commands clipped", () => {
+		const cwd = "/work/repo";
+		expect(describeToolTarget("read", { path: "src/a.ts" }, cwd)).toBe("src/a.ts");
+		expect(describeToolTarget("edit", { path: "/work/repo/src/a.ts", edits: [] }, cwd)).toBe("src/a.ts");
+		expect(describeToolTarget("write", { path: "./src/b.ts" }, cwd)).toBe("src/b.ts");
+		expect(describeToolTarget("ls", { path: "/work/repo" }, cwd)).toBe(".");
+		// Outside cwd there is no shorter honest spelling; the path stays as given.
+		expect(describeToolTarget("read", { path: "/etc/hosts" }, cwd)).toBe("/etc/hosts");
+		expect(describeToolTarget("grep", { pattern: "TODO\\b", path: "src" }, cwd)).toBe("TODO\\b");
+		expect(describeToolTarget("find", { pattern: "**/*.ts" }, cwd)).toBe("**/*.ts");
+		const long = `echo ${"x".repeat(100)}`;
+		const command = describeToolTarget("bash", { command: long }, cwd) ?? "";
+		expect(command.length).toBe(ACTIVITY_COMMAND_CHARS);
+		expect(command.endsWith("…")).toBe(true);
+		expect(describeToolTarget("bash", { command: "ls\n  -la" }, cwd)).toBe("ls -la");
+		// Unknown tools and missing or non-string arguments record no target rather than a guess.
+		expect(describeToolTarget("nope", { path: "x" }, cwd)).toBeUndefined();
+		expect(describeToolTarget("read", { path: 5 }, cwd)).toBeUndefined();
+		expect(describeToolTarget("read", undefined, cwd)).toBeUndefined();
+	});
+
+	test("clipCommand and displayPath edge cases", () => {
+		expect(clipCommand("  a   b  ")).toBe("a b");
+		expect(clipCommand("x".repeat(ACTIVITY_COMMAND_CHARS))).toBe("x".repeat(ACTIVITY_COMMAND_CHARS));
+		expect(displayPath("a/../b.ts", "/w")).toBe("b.ts");
+		expect(displayPath("../sibling/c.ts", "/w/repo")).toBe("../sibling/c.ts");
+	});
+
+	test("a tools.bash failure yields its exit code from pi's error text; other errors yield none", () => {
+		expect(exitCodeFromBashError("some output\n\nCommand exited with code 127")).toBe(127);
+		expect(exitCodeFromBashError("Command timed out after 180 seconds")).toBeUndefined();
+		expect(exitCodeFromBashError(undefined)).toBeUndefined();
+	});
+
+	// A loop that reads 500 files must not turn the cell's details into a
+	// 500-entry array: past the cap the trail records how many more, not what.
+	test("the log caps at MAX_ACTIVITY_ENTRIES and folds the overflow into one +N more tail", () => {
+		const log = new ActivityLog();
+		expect(log.isEmpty).toBe(true);
+		for (let i = 0; i < MAX_ACTIVITY_ENTRIES + 7; i++) {
+			log.push({ kind: "tool", name: "read", target: `f${i}.ts`, ok: true });
+		}
+		const trail = log.snapshot();
+		expect(trail).toHaveLength(MAX_ACTIVITY_ENTRIES + 1);
+		expect(trail[MAX_ACTIVITY_ENTRIES - 1]?.target).toBe(`f${MAX_ACTIVITY_ENTRIES - 1}.ts`);
+		expect(trail.at(-1)).toEqual({ kind: "tool", name: "…", target: "+7 more", ok: true });
+		// Snapshots are independent copies: a consumer mutating one cannot corrupt the log.
+		const again = log.snapshot();
+		expect(again).not.toBe(trail);
+		expect(again).toEqual(trail);
+		const small = new ActivityLog();
+		small.push({ kind: "shell", name: "bash", target: "ls", ok: true, exitCode: 0 });
+		expect(small.snapshot()).toHaveLength(1);
 	});
 });
 
@@ -862,6 +948,131 @@ describe("render-core: layout", () => {
 	test("a cell without frames renders no subagent chip", () => {
 		const deps = testDeps();
 		expect(stripAnsi(renderExecuteCell(makeState(), 200, deps)[0])).not.toContain("subagent");
+	});
+
+	// The activity line answers "what did this cell touch" without a keypress:
+	// grouped by tool in first-seen order, paths joined, long lists folded to
+	// +N, failures marked, shell exits counted. It is one line, and it is only
+	// there when something was touched, so pure-computation cells keep their
+	// single-row height.
+	const entry = (partial: Partial<ActivityEntry> & Pick<ActivityEntry, "name">): ActivityEntry => ({
+		kind: "tool",
+		ok: true,
+		...partial,
+	});
+
+	test("formatActivitySummary groups by tool in first-seen order and joins paths", () => {
+		const trail = [
+			entry({ name: "read", target: "src/a.ts" }),
+			entry({ name: "edit", target: "src/a.ts" }),
+			entry({ name: "read", target: "src/b.ts" }),
+			entry({ name: "edit", target: "src/index.ts" }),
+			entry({ kind: "shell", name: "bash", target: "bun test", exitCode: 0 }),
+		];
+		expect(formatActivitySummary(trail)).toBe(
+			"read src/a.ts, src/b.ts · edit src/a.ts, src/index.ts · bash ×1 (exit 0)",
+		);
+	});
+
+	test("formatActivitySummary folds past three targets, dedupes repeats, and keeps a target-less call", () => {
+		const reads = ["a", "b", "b", "c", "d", "e"].map((t) => entry({ name: "read", target: `${t}.ts` }));
+		expect(formatActivitySummary(reads)).toBe("read a.ts, b.ts, c.ts, +2");
+		expect(formatActivitySummary([entry({ name: "ls" })])).toBe("ls");
+		expect(formatActivitySummary([entry({ name: "…", target: "+9 more" })])).toBe("… +9 more");
+		expect(formatActivitySummary([])).toBe("");
+	});
+
+	test("formatActivitySummary marks failed tools with ✗ and counts non-zero shell exits", () => {
+		const trail = [
+			entry({ name: "edit", target: "src/a.ts", ok: false }),
+			entry({ kind: "shell", name: "bash", target: "bun test", ok: false, exitCode: 1 }),
+			entry({ kind: "shell", name: "bash", target: "bun test", ok: false, exitCode: 1 }),
+			entry({ name: "bash", target: "exit 2", ok: false, exitCode: 2 }),
+			entry({ kind: "shell", name: "bash", target: "ls", exitCode: 0 }),
+		];
+		expect(formatActivitySummary(trail)).toBe("edit✗ src/a.ts · bash ×4 (exit 1 ×2, exit 2 ×1)");
+		// A tools.bash that failed without an exit code (timeout, abort) is a ✗, not an exit.
+		expect(formatActivitySummary([entry({ name: "bash", target: "sleep 999", ok: false })])).toBe("bash✗ ×1");
+		const groups = groupActivity(trail);
+		expect(groups.map((g) => g.name)).toEqual(["edit", "bash"]);
+		expect(groups[1]?.failed).toBe(0);
+		expect(groups[1]?.nonZeroExits).toEqual([
+			{ code: 1, count: 2 },
+			{ code: 2, count: 1 },
+		]);
+	});
+
+	test("a collapsed cell with activity renders the summary as a second row; without activity it stays one row", () => {
+		const deps = testDeps();
+		const activity = [
+			entry({ name: "read", target: "src/a.ts", durationMs: 12 }),
+			entry({ kind: "shell", name: "bash", target: "bun test", exitCode: 0, durationMs: 1500 }),
+		];
+		const rows = renderExecuteCell(makeState({ details: { ...makeState().details, activity } }), 120, deps).map(
+			stripAnsi,
+		);
+		expect(rows).toHaveLength(2);
+		expect(rows[1]).toBe("   read src/a.ts · bash ×1 (exit 0)".padEnd(120));
+		// The header itself is unchanged: the summary lives on its own row.
+		expect(rows[0]).not.toContain("src/a.ts");
+		expect(renderExecuteCell(makeState({ details: { ...makeState().details, activity: [] } }), 120, deps)).toHaveLength(
+			1,
+		);
+		expect(renderExecuteCell(makeState(), 120, deps)).toHaveLength(1);
+	});
+
+	test("the activity row is visible while the cell is still running", () => {
+		const deps = testDeps();
+		const running = makeState({
+			details: { activity: [entry({ name: "read", target: "src/a.ts" })] },
+			hasResult: false,
+			isPartial: true,
+		});
+		expect(statusKind(running)).toBe("running");
+		const rows = renderExecuteCell(running, 120, deps).map(stripAnsi);
+		expect(rows).toHaveLength(2);
+		expect(rows[1]).toContain("read src/a.ts");
+	});
+
+	test("a long activity row is truncated with an ellipsis and never exceeds the pane", () => {
+		const deps = testDeps();
+		const activity = Array.from({ length: 12 }, (_, i) =>
+			entry({ name: `tool${i}`, target: `some/long/path/file${i}.ts` }),
+		);
+		for (const width of [30, 60, 100]) {
+			const row = stripAnsi(renderExecuteCell(makeState({ details: { activity } }), width, deps)[1] ?? "");
+			expect(row.length).toBeLessThanOrEqual(width);
+			expect(row.trimEnd().endsWith("…")).toBe(true);
+		}
+	});
+
+	test("expanded renders the full activity list after the output, one action per line, failures in the error color", () => {
+		const deps = testDeps({ fg: (color, text) => `<${color}>${text}</${color}>` });
+		const activity = [
+			entry({ name: "read", target: "src/a.ts", durationMs: 12 }),
+			entry({ name: "edit", target: "src/a.ts", ok: false, durationMs: 3 }),
+			entry({ kind: "shell", name: "bash", target: "bun test", ok: false, exitCode: 1, durationMs: 2300 }),
+		];
+		const state = makeState({ expanded: true, details: { ...makeState().details, activity } });
+		const rows = renderExecuteCell(state, 120, deps);
+		const plain = rows.map((row) =>
+			row
+				.replace(/<\/?[a-zA-Z]+>/g, "")
+				.replace(ANSI, "")
+				.trimEnd(),
+		);
+		const outputAt = plain.findIndex((row) => row.includes("hello"));
+		const listAt = plain.findIndex((row) => row.includes("read  src/a.ts  12ms"));
+		expect(outputAt).toBeGreaterThan(0);
+		expect(listAt).toBeGreaterThan(outputAt);
+		expect(plain[listAt - 1]).toBe("");
+		expect(plain[listAt + 1]).toBe("   edit  src/a.ts  3ms");
+		expect(plain[listAt + 2]).toBe("   bash  bun test  2.3s  exit 1");
+		expect(rows[listAt]).toContain("<muted>read  src/a.ts  12ms</muted>");
+		expect(rows[listAt + 1]).toContain("<error>edit  src/a.ts  3ms</error>");
+		expect(rows[listAt + 2]).toContain("<error>bash  bun test  2.3s  exit 1</error>");
+		// Expanded shows the list, not the collapsed summary row as well.
+		expect(plain.filter((row) => row.includes("read src/a.ts"))).toHaveLength(0);
 	});
 
 	test("background is re-armed after inner SGR resets so it spans the row", () => {
