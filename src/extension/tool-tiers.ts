@@ -207,3 +207,25 @@ export function notFoundToolName(toolName: string, result: unknown, isError: boo
 	if (!match) return undefined;
 	return match[1] === toolName ? toolName : undefined;
 }
+
+/** Session entry type that records tools the model activated (load_tools or a direct call). */
+export const ACTIVATED_TOOLS_ENTRY = "pi-rlm-tools";
+
+/**
+ * Names the model activated earlier on this branch, in first-seen order. Read
+ * from the session so an activation survives reload and resume: the model's
+ * context still refers to those tools, and a surface that silently forgot
+ * them makes the next direct call fail with "not found".
+ */
+export function foldActivatedTools(
+	entries: ReadonlyArray<{ type?: string; customType?: string; data?: unknown }>,
+): string[] {
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		if (entry?.type !== "custom" || entry.customType !== ACTIVATED_TOOLS_ENTRY) continue;
+		const names = (entry.data as { activated?: unknown } | undefined)?.activated;
+		if (!Array.isArray(names)) continue;
+		for (const n of names) if (typeof n === "string" && n) seen.add(n);
+	}
+	return [...seen];
+}

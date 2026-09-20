@@ -1,3 +1,4 @@
+import { foldActivatedTools } from "../src/extension/tool-tiers";
 /**
  * Unit coverage for the pieces the contract suite cannot reach directly.
  *
@@ -1395,5 +1396,19 @@ describe("notFoundToolName", () => {
 		expect(notFoundToolName("subagent", err("Tool subagent not found"), false)).toBeUndefined();
 		expect(notFoundToolName("subagent", err("Tool budget exceeded"), true)).toBeUndefined();
 		expect(notFoundToolName("subagent", err("Tool recall not found"), true)).toBeUndefined();
+	});
+});
+
+describe("foldActivatedTools", () => {
+	test("collects names from pi-rlm-tools entries in first-seen order, ignoring junk", () => {
+		const entries = [
+			{ type: "custom", customType: "pi-rlm-tools", data: { activated: ["a", "b"] } },
+			{ type: "custom", customType: "other", data: { activated: ["z"] } },
+			{ type: "message" },
+			{ type: "custom", customType: "pi-rlm-tools", data: { activated: ["b", "", 3, "c"] } },
+			{ type: "custom", customType: "pi-rlm-tools", data: {} },
+		];
+		expect(foldActivatedTools(entries as never)).toEqual(["a", "b", "c"]);
+		expect(foldActivatedTools([])).toEqual([]);
 	});
 });

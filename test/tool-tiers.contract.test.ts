@@ -35,6 +35,8 @@ class FakePi {
 	active: string[] = [];
 	setActiveCalls: string[][] = [];
 	messages: unknown[] = [];
+	/** Session entries appended via appendEntry, as pi's branch would hold them. */
+	entries: Array<{ type: string; customType: string; data: unknown }> = [];
 
 	constructor(seed: Array<{ name: string; description?: string; source?: string; path?: string }>) {
 		for (const entry of seed) this.seedTool(entry);
@@ -85,6 +87,9 @@ class FakePi {
 			sendMessage(message: unknown) {
 				self.messages.push(message);
 			},
+			appendEntry(customType: string, data: unknown) {
+				self.entries.push({ type: "custom", customType, data });
+			},
 		} as unknown as ExtensionAPI;
 	}
 
@@ -101,7 +106,7 @@ class FakePi {
 	}
 
 	ctx() {
-		return { cwd: cwd, sessionManager: { getSessionFile: () => undefined } };
+		return { cwd: cwd, sessionManager: { getSessionFile: () => undefined, getBranch: () => [...this.entries] } };
 	}
 }
 
@@ -207,6 +212,40 @@ describe("tool surface: load_tools", () => {
 		const last = fake.setActiveCalls.at(-1) ?? [];
 		for (const name of before) expect(last).toContain(name);
 		expect(last).toContain("model_list");
+	});
+
+	test("a loaded tool is remembered on the session and comes back after the next session_start shrink", async () => {
+		const fake = await startSession();
+		await fake.callTool("load_tools", { names: ["model_list"] });
+		expect(fake.active).toContain("model_list");
+		expect(fake.entries.map((e) => e.customType)).toContain("pi-rlm-tools");
+		// A reload/resume: pi fires session_start again and the surface shrinks —
+		// but not below what the conversation already activated.
+		await fake.emit("session_start", {}, fake.ctx());
+		expect(fake.active).toContain("model_list");
+		expect(fake.active).not.toContain("advisor");
+	});
+
+	test("a direct call to an unloaded tool activates it, remembers it, and steers the model to retry", async () => {
+		const fake = await startSession();
+		expect(fake.active).not.toContain("advisor");
+		await fake.emit(
+			"tool_execution_end",
+			{
+				toolCallId: "c1",
+				toolName: "advisor",
+				isError: true,
+				result: { content: [{ type: "text", text: "Tool advisor not found" }] },
+			},
+			fake.ctx(),
+		);
+		expect(fake.active).toContain("advisor");
+		expect(fake.entries.some((e) => e.customType === "pi-rlm-tools")).toBe(true);
+		const steer = fake.messages.find((m) => (m as { customType?: string }).customType === "pi-rlm-tools") as
+			| { content: string }
+			| undefined;
+		expect(steer?.content).toContain("advisor");
+		expect(steer?.content).toContain("Call it again");
 	});
 
 	test("dropped and bridged tools are not loadable even by exact name", async () => {

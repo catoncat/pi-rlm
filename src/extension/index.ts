@@ -33,8 +33,10 @@ import {
 	type SubagentHost,
 } from "./subagents.js";
 import {
+	ACTIVATED_TOOLS_ENTRY,
 	buildLoadToolsCatalog,
 	buildLoadToolsDescription,
+	foldActivatedTools,
 	formatLoadToolsResult,
 	notFoundToolName,
 	resolveLoadableTools,
@@ -239,10 +241,29 @@ export default function (pi: ExtensionAPI) {
 				// Additive only: pi records the names added during this call on the
 				// tool result and serves them through deferred loading where the
 				// provider supports it. Removing anything here would forfeit that.
-				if (selection.added.length > 0) pi.setActiveTools([...pi.getActiveTools(), ...selection.added]);
+				if (selection.added.length > 0) {
+					pi.setActiveTools([...pi.getActiveTools(), ...selection.added]);
+					rememberActivated(selection.added);
+				}
 				return { content: [{ type: "text", text: formatLoadToolsResult(selection) }], details: selection };
 			},
 		});
+	};
+
+	// Activations are session state: remembered on the branch, re-applied after
+	// the session_start shrink and on every turn (additively, like residents).
+	const rememberActivated = (names: readonly string[]): void => {
+		if (names.length > 0) pi.appendEntry(ACTIVATED_TOOLS_ENTRY, { activated: [...names] });
+	};
+	const rememberedActivations = (ctx: { sessionManager?: { getBranch?: () => unknown[] } }): string[] => {
+		const entries = (ctx.sessionManager?.getBranch?.() ?? []) as Array<{
+			type?: string;
+			customType?: string;
+			data?: unknown;
+		}>;
+		const registered = new Set(pi.getAllTools().map((t) => t.name));
+		const drop = resolveRlmDropSet();
+		return foldActivatedTools(entries).filter((n) => registered.has(n) && !drop.has(n));
 	};
 
 	// Replace pi's default prompt wholesale. It describes read, bash, and edit
@@ -265,7 +286,9 @@ export default function (pi: ExtensionAPI) {
 		const all = pi.getAllTools();
 		const allNames = all.map((t) => t.name);
 		const current = pi.getActiveTools();
-		const next = resolveRlmEnsuredSurface(current, allNames, { drop, resident });
+		const ensured = resolveRlmEnsuredSurface(current, allNames, { drop, resident });
+		const remembered = rememberedActivations(ctx).filter((n) => !ensured.includes(n));
+		const next = remembered.length > 0 ? [...ensured, ...remembered] : ensured;
 		if (!sameToolSet(current, next)) pi.setActiveTools(next);
 		// The prompt names the resident tier only: loaded tools vary per turn and
 		// their descriptions already travel in the schema, while the system
@@ -323,12 +346,14 @@ export default function (pi: ExtensionAPI) {
 		// call; everything else registered stays reachable through load_tools,
 		// whose catalog is built here, after every extension has registered.
 		syncLoadTools();
-		pi.setActiveTools(
-			resolveRlmResidentSurface(
-				pi.getAllTools().map((t) => t.name),
-				{ drop: resolveRlmDropSet(), resident: resolveRlmResidentTools() },
-			),
+		const surface = resolveRlmResidentSurface(
+			pi.getAllTools().map((t) => t.name),
+			{ drop: resolveRlmDropSet(), resident: resolveRlmResidentTools() },
 		);
+		// Tools the model activated earlier on this branch come back with it:
+		// the shrink is a reset of the default, not of the conversation's working set.
+		const remembered = rememberedActivations(ctx).filter((n) => !surface.includes(n));
+		pi.setActiveTools(remembered.length > 0 ? [...surface, ...remembered] : surface);
 		// A new session may run under different auth or a different model.
 		modelsSeed = undefined;
 		// Resolve before the engine is built below, so the subagent host is
@@ -374,6 +399,17 @@ export default function (pi: ExtensionAPI) {
 		});
 		if (!loadable.some((t) => t.name === name) || pi.getActiveTools().includes(name)) return;
 		pi.setActiveTools([...pi.getActiveTools(), name]);
+		rememberActivated([name]);
+		// Pi's "not found" text cannot be rewritten (that path skips the tool_result
+		// hook), so tell the model separately, before its next call.
+		pi.sendMessage(
+			{
+				customType: ACTIVATED_TOOLS_ENTRY,
+				content: `Tool ${name} was not loaded when you called it; it is active now. Call it again directly.`,
+				display: false,
+			},
+			{ deliverAs: "steer" },
+		);
 		try {
 			ctx.ui?.notify?.(`已按需激活工具 ${name}（模型直接调用了未加载的工具）`, "info");
 		} catch {}
