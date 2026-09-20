@@ -111,6 +111,7 @@ const cleanups: Array<() => Promise<void>> = [];
 const REGISTRY = [
 	{ name: "read", source: "builtin", path: "<builtin:read>" },
 	{ name: "bash", source: "builtin", path: "<builtin:bash>" },
+	{ name: "edit", source: "builtin", path: "<builtin:edit>" },
 	{ name: "todo", description: "Manage a task list.", source: "npm:@juicesharp/rpiv-todo" },
 	{ name: "ask_user_question", description: "Ask the user structured questions.", source: "npm:rpiv-ask" },
 	{
@@ -168,7 +169,9 @@ afterAll(() => {
 describe("tool surface: session start", () => {
 	test("shrinks to the resident tier and registers load_tools with the loadable catalog", async () => {
 		const fake = await startSession();
-		expect(fake.active.sort()).toEqual(["ask_user_question", "execute", "load_tools", "todo"]);
+		// edit is the one bridged builtin on the model surface (hybrid: also tools.edit);
+		// read and bash stay cell-only.
+		expect(fake.active.sort()).toEqual(["ask_user_question", "edit", "execute", "load_tools", "todo"]);
 		const loader = fake.tools.get("load_tools")?.tool;
 		expect(loader).toBeDefined();
 		// Catalog = registered − resident − drop − bridged, grouped by source.
@@ -176,7 +179,15 @@ describe("tool surface: session start", () => {
 		expect(description).toContain("model-manager:");
 		expect(description).toContain("model_list — List all available providers and models registered in Pi");
 		expect(description).toContain("rpiv-advisor:");
-		for (const excluded of ["todo", "ask_user_question", "compaction_continue_state", "read", "bash", "execute"]) {
+		for (const excluded of [
+			"todo",
+			"ask_user_question",
+			"compaction_continue_state",
+			"read",
+			"bash",
+			"edit",
+			"execute",
+		]) {
 			expect(description).not.toMatch(new RegExp(`^${excluded}( —|$)`, "m"));
 		}
 	});
@@ -253,7 +264,8 @@ describe("tool surface: before_agent_start", () => {
 			{ type: "before_agent_start", systemPromptOptions: {} },
 			fake.ctx(),
 		)) as Array<{ systemPrompt: string }>;
-		expect(result.systemPrompt).toContain("todo, ask_user_question, load_tools");
+		expect(result.systemPrompt).toContain("edit, todo, ask_user_question, load_tools");
+		expect(result.systemPrompt).toContain("`edit` at the top level is for small, exact text replacements");
 		expect(result.systemPrompt).toContain("activate it with `load_tools`");
 		expect(result.systemPrompt).not.toMatch(/^.*\badvisor\b.*$/m);
 	});

@@ -11,16 +11,27 @@
  * builtins stay off the model list by default because the execute bridge
  * already mounts them as tools.* inside the evaluator.
  *
+ * A bridged builtin named in the resident list is on the surface both ways:
+ * callable at the top level and as tools.* in a cell (Anthropic's programmatic
+ * tool calling allows the same tool on both). `edit` is resident by default:
+ * a small exact replacement is one top-level call, and a cell around it is
+ * pure overhead. `read` deliberately is not — a top-level read pours whole
+ * files back into the context that the cell bridge exists to keep out.
+ *
  * PI_RLM_RESIDENT_TOOLS  comma-separated resident names (replaces the default
  *                        list when set; unregistered names are ignored)
  * PI_RLM_DROP_TOOLS      comma-separated extra names to drop (replaces the default
  *                        extra list when set, including empty string = extras none);
- *                        a dropped tool is neither resident nor loadable
+ *                        a dropped tool is neither resident nor loadable, even a
+ *                        bridged builtin the resident list names
  * PI_RLM_KEEP_BUILTINS=1 do not drop read/bash/edit/… (list them in
  *                        PI_RLM_RESIDENT_TOOLS to put them on the model surface)
  */
 
-/** Mounted inside the evaluator as tools.*; dropped from the model list by default. */
+/**
+ * Mounted inside the evaluator as tools.*; dropped from the model list unless
+ * named resident, and never loadable through load_tools (tool-tiers.ts).
+ */
 export const BRIDGED_BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 
 /**
@@ -42,6 +53,7 @@ export const ALWAYS_RESIDENT_TOOLS = ["execute", "load_tools"] as const;
  */
 export const DEFAULT_RESIDENT_TOOLS = [
 	"execute",
+	"edit",
 	"rlm_mode",
 	"todo",
 	"ask_user_question",
@@ -53,7 +65,18 @@ export const DEFAULT_RESIDENT_TOOLS = [
 	"load_tools",
 ] as const;
 
-export function resolveRlmDropSet(env: NodeJS.ProcessEnv = process.env): Set<string> {
+/**
+ * Names kept off the model surface: the explicit extras, plus the bridged
+ * builtins that are not named resident. Precedence, highest first: an explicit
+ * drop, then a resident listing, then the default removal of bridged builtins
+ * — so `edit` is on the surface by default while PI_RLM_DROP_TOOLS=edit still
+ * removes it. `resident` defaults to the same env-derived list the surface
+ * uses, so the two resolve consistently when called without arguments.
+ */
+export function resolveRlmDropSet(
+	env: NodeJS.ProcessEnv = process.env,
+	resident: readonly string[] = resolveRlmResidentTools(env),
+): Set<string> {
 	const raw = env.PI_RLM_DROP_TOOLS;
 	const extras =
 		raw !== undefined
@@ -64,7 +87,9 @@ export function resolveRlmDropSet(env: NodeJS.ProcessEnv = process.env): Set<str
 			: [...DEFAULT_EXTRA_DROP_TOOLS];
 	const drop = new Set<string>(extras);
 	if (env.PI_RLM_KEEP_BUILTINS !== "1") {
-		for (const name of BRIDGED_BUILTIN_TOOLS) drop.add(name);
+		for (const name of BRIDGED_BUILTIN_TOOLS) {
+			if (!resident.includes(name)) drop.add(name);
+		}
 	}
 	return drop;
 }
@@ -120,8 +145,9 @@ export function resolveRlmResidentSurface(allToolNames: readonly string[], optio
 
 /**
  * The per-turn surface: every currently active tool that is still registered
- * and neither dropped nor a bridged builtin, in its current order, plus any
- * resident tool that is missing. Tools the model activated through load_tools
+ * and neither dropped nor a bridged builtin (unless it is resident, like
+ * `edit`), in its current order, plus any resident tool that is missing.
+ * Tools the model activated through load_tools
  * are never removed here — pi records additive changes on the loader's result
  * and only keeps deferred loading while the set keeps growing.
  */

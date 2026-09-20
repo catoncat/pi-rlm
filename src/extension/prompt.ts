@@ -191,6 +191,14 @@ function buildHostVisibleToolsSection(summaries: readonly string[]): string {
 		"",
 		names.join(", "),
 		"",
+		// Only when edit is actually resident: the sentence must not advertise a
+		// top-level tool an operator removed with PI_RLM_DROP_TOOLS.
+		...(names.includes("edit")
+			? [
+					"`edit` at the top level is for small, exact text replacements (it is also `tools.edit` in a cell). Reading, searching, and shell commands stay in cells.",
+					"",
+				]
+			: []),
 		"Every other registered tool is inactive until you activate it with `load_tools` (by names, by group, or by keyword query; its description lists the catalog). Once activated, call it at the top level like the tools above.",
 	].join("\n");
 }

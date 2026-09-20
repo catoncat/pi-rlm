@@ -79,7 +79,9 @@ export function summarizeForCatalog(description: string | undefined, max = CATAL
 /**
  * The loadable tier, in registry order. Resident names are excluded whether or
  * not they are registered, dropped names are unreachable by design, and the
- * bridged builtins are already mounted as tools.* inside the evaluator.
+ * bridged builtins are never loadable: read/bash/write/grep/find/ls are
+ * already mounted as tools.* inside the evaluator, and the one that belongs
+ * on the model surface (edit) gets there by being resident, not by loading.
  */
 export function resolveLoadableTools<T extends LoadableToolInfo>(
 	allTools: readonly T[],

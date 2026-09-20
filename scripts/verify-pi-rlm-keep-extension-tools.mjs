@@ -53,12 +53,19 @@ const { resolveLoadableTools, buildLoadToolsCatalog, selectToolsToLoad } = await
   join(ROOT, "src/extension/tool-tiers.ts")
 );
 
+// Bridged builtins are dropped unless named resident: edit is resident by
+// default (hybrid surface: top-level and tools.edit), the other six are not.
 const d = resolveRlmDropSet({});
-for (const n of BRIDGED_BUILTIN_TOOLS) {
+const CELL_ONLY_BUILTINS = BRIDGED_BUILTIN_TOOLS.filter((n) => n !== "edit");
+for (const n of CELL_ONLY_BUILTINS) {
   if (!d.has(n)) {
     console.error("A missing builtin in drop", n);
     process.exit(1);
   }
+}
+if (d.has("edit")) {
+  console.error("A edit must not be dropped while resident");
+  process.exit(1);
 }
 if (!d.has("compaction_continue_state")) {
   console.error("A missing default extra");
@@ -67,13 +74,19 @@ if (!d.has("compaction_continue_state")) {
 console.log("A default drop", d.size);
 
 const dEmpty = resolveRlmDropSet({ PI_RLM_DROP_TOOLS: "" });
-if (dEmpty.has("compaction_continue_state") || dEmpty.size !== BRIDGED_BUILTIN_TOOLS.length) {
+if (dEmpty.has("compaction_continue_state") || dEmpty.size !== CELL_ONLY_BUILTINS.length) {
   console.error("B empty extras failed", [...dEmpty]);
   process.exit(1);
 }
 const dCustom = resolveRlmDropSet({ PI_RLM_DROP_TOOLS: "only_this" });
 if (!dCustom.has("only_this") || dCustom.has("compaction_continue_state") || !dCustom.has("read")) {
   console.error("B custom failed", [...dCustom]);
+  process.exit(1);
+}
+// An explicit drop beats the resident listing, even for edit.
+const dEditOff = resolveRlmDropSet({ PI_RLM_DROP_TOOLS: "edit" });
+if (!dEditOff.has("edit")) {
+  console.error("B explicit drop of edit failed", [...dEditOff]);
   process.exit(1);
 }
 console.log("B env override ok");
@@ -89,6 +102,7 @@ const all = [
   "execute",
   "read",
   "bash",
+  "edit",
   "ask_user_question",
   "advisor",
   "subagent",
@@ -111,7 +125,7 @@ if (JSON.stringify(residentOverride) !== JSON.stringify(["advisor", "execute", "
 }
 const surfaceOptions = { drop: d, resident, always: ["execute", "load_tools", "rlm_mode"] };
 const active = resolveRlmResidentSurface(all, surfaceOptions);
-const expect = ["execute", "load_tools", "rlm_mode", "todo", "ask_user_question"];
+const expect = ["execute", "load_tools", "rlm_mode", "edit", "todo", "ask_user_question"];
 if (JSON.stringify(active) !== JSON.stringify(expect)) {
   console.error("D resident surface mismatch", active, expect);
   process.exit(1);
@@ -122,7 +136,7 @@ if (active.includes("read") || active.includes("compaction_continue_state") || a
 }
 // The per-turn ensure keeps a model-loaded tool (advisor) and re-adds a lost resident (todo).
 const ensured = resolveRlmEnsuredSurface(["execute", "load_tools", "rlm_mode", "advisor", "read"], all, surfaceOptions);
-if (!ensured.includes("advisor") || !ensured.includes("todo") || ensured.includes("read")) {
+if (!ensured.includes("advisor") || !ensured.includes("todo") || !ensured.includes("edit") || ensured.includes("read")) {
   console.error("D ensured surface failed", ensured);
   process.exit(1);
 }
@@ -141,7 +155,7 @@ if (JSON.stringify(loadableNames) !== JSON.stringify(["advisor", "subagent"])) {
   process.exit(1);
 }
 const catalog = buildLoadToolsCatalog(loadable);
-for (const n of ["todo", "read", "compaction_continue_state", "execute"]) {
+for (const n of ["todo", "read", "bash", "edit", "compaction_continue_state", "execute"]) {
   if (new RegExp(`^${n}( |$)`, "m").test(catalog)) {
     console.error("D2 catalog leaks", n);
     process.exit(1);

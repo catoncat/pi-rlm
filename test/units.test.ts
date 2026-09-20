@@ -576,6 +576,14 @@ describe("system prompt", () => {
 		expect(prompt).toContain("Without that tool, start the work detached (`Bun.spawn`");
 	});
 
+	test("the edit sentence appears only when edit is resident", () => {
+		const withEdit = buildRlmTsPrompt({ cwd: "/tmp", hostToolSummaries: ["edit — Edit a file.", "todo — Tasks."] });
+		expect(withEdit).toContain("`edit` at the top level is for small, exact text replacements");
+		expect(withEdit).toContain("Reading, searching, and shell commands stay in cells");
+		const withoutEdit = buildRlmTsPrompt({ cwd: "/tmp", hostToolSummaries: ["todo — Tasks."] });
+		expect(withoutEdit).not.toContain("`edit` at the top level");
+	});
+
 	test("child doctrine appears only at depth > 0", () => {
 		// "child agent" alone also appears in the subagent guidance; the doctrine's
 		// identity sentence is the distinctive marker.
@@ -952,6 +960,7 @@ describe("resident tier resolution", () => {
 		"execute",
 		"read",
 		"bash",
+		"edit",
 		"rlm_mode",
 		"todo",
 		"ask_user_question",
@@ -981,7 +990,39 @@ describe("resident tier resolution", () => {
 	test("the resident surface is resident ∩ registered − drop, execute first; unregistered names are ignored", () => {
 		const surface = resolveRlmResidentSurface(registry, { drop: resolveRlmDropSet({}) });
 		// `process`, `intercom`, `web_search`, `fetch_content` are configured but not registered here.
-		expect(surface).toEqual(["execute", "load_tools", "rlm_mode", "todo", "ask_user_question", "recall"]);
+		expect(surface).toEqual(["execute", "load_tools", "edit", "rlm_mode", "todo", "ask_user_question", "recall"]);
+	});
+
+	// The hybrid surface: a bridged builtin named resident is callable both at the
+	// top level and as tools.* in a cell. Only edit qualifies by default — a
+	// top-level read would pour whole files back into the context.
+	test("edit is resident by default and survives the bridged-builtin removal; read does not", () => {
+		expect(DEFAULT_RESIDENT_TOOLS).toContain("edit");
+		const drop = resolveRlmDropSet({});
+		expect(drop.has("edit")).toBe(false);
+		expect(drop.has("read")).toBe(true);
+		expect(drop.has("bash")).toBe(true);
+		const surface = resolveRlmResidentSurface(registry, { drop });
+		expect(surface).toContain("edit");
+		expect(surface).not.toContain("read");
+		const ensured = resolveRlmEnsuredSurface(["execute", "edit", "read"], registry, { drop });
+		expect(ensured).toContain("edit");
+		expect(ensured).not.toContain("read");
+	});
+
+	test("an explicit drop still beats a resident listing, even for edit", () => {
+		const env = { PI_RLM_DROP_TOOLS: "edit" };
+		const drop = resolveRlmDropSet(env);
+		expect(drop.has("edit")).toBe(true);
+		expect(resolveRlmResidentSurface(registry, { drop, resident: resolveRlmResidentTools(env) })).not.toContain("edit");
+		// And an operator listing read as resident puts it on the surface without PI_RLM_KEEP_BUILTINS.
+		const readEnv = { PI_RLM_RESIDENT_TOOLS: "read" };
+		const readDrop = resolveRlmDropSet(readEnv);
+		expect(readDrop.has("read")).toBe(false);
+		expect(readDrop.has("edit")).toBe(true);
+		expect(resolveRlmResidentSurface(registry, { drop: readDrop, resident: resolveRlmResidentTools(readEnv) })).toEqual(
+			["execute", "load_tools", "read"],
+		);
 	});
 
 	test("drop wins over resident for every tool except the forced pair", () => {
