@@ -6,6 +6,8 @@
  * `render.ts` binds the real implementations.
  */
 
+import type { ActivityEntry } from "../engine/activity.js";
+
 export interface ExecuteDetails {
 	status?: "ok" | "error" | "aborted" | string;
 	durationMs?: number;
@@ -21,6 +23,8 @@ export interface ExecuteDetails {
 	outputLimitReached?: boolean;
 	/** The cell's optional one-line description, for display. */
 	cellDescription?: string;
+	/** What the cell touched (tools.* and Bun.$), for the collapsed summary and expanded list. */
+	activity?: ActivityEntry[];
 }
 
 export interface ExecuteRenderState {
@@ -56,6 +60,10 @@ export interface RenderDeps {
 
 const OUTPUT_INDENT = "  ";
 const SPINNER_FRAMES = ["◐", "◓", "◑", "◒"];
+/** Sits under the header's language label: leading space, marker, space. */
+const ACTIVITY_INDENT = "   ";
+/** Beyond this many targets per tool the rest fold into `+N`. */
+const ACTIVITY_TARGETS_SHOWN = 3;
 
 export function formatDuration(durationMs: number | undefined): string | undefined {
 	if (durationMs === undefined) return undefined;
@@ -103,6 +111,103 @@ export function closeOpenSgr(line: string): string {
 		}
 	}
 	return fgOpen || bgOpen ? `${line}\x1b[0m` : line;
+}
+
+// ── activity ─────────────────────────────────────────────────────────────────
+
+export interface ActivityGroup {
+	name: string;
+	/** Distinct targets in first-seen order; a file read in three chunks is one file. */
+	targets: string[];
+	count: number;
+	/** Failures that carry no exit code — a thrown tool, a refused edit. */
+	failed: number;
+	/** Non-zero exit codes and how often each occurred, in first-seen order. */
+	nonZeroExits: Array<{ code: number; count: number }>;
+}
+
+/** Group by tool name in first-appearance order; shell and tools.bash both arrive named `bash`. */
+export function groupActivity(activity: readonly ActivityEntry[]): ActivityGroup[] {
+	const groups = new Map<string, ActivityGroup>();
+	for (const entry of activity) {
+		let group = groups.get(entry.name);
+		if (!group) {
+			group = { name: entry.name, targets: [], count: 0, failed: 0, nonZeroExits: [] };
+			groups.set(entry.name, group);
+		}
+		group.count += 1;
+		if (entry.target && !group.targets.includes(entry.target)) group.targets.push(entry.target);
+		if (entry.exitCode !== undefined && entry.exitCode !== 0) {
+			const exit = group.nonZeroExits.find((e) => e.code === entry.exitCode);
+			if (exit) exit.count += 1;
+			else group.nonZeroExits.push({ code: entry.exitCode, count: 1 });
+		} else if (!entry.ok) {
+			group.failed += 1;
+		}
+	}
+	return [...groups.values()];
+}
+
+/**
+ * `read src/a.ts, src/b.ts · edit src/a.ts · bash ×2 (exit 2 ×1)` — plain
+ * text, so tests can read it and the coloured variant below can wrap it.
+ */
+export function formatActivitySummary(activity: readonly ActivityEntry[]): string {
+	return groupActivity(activity)
+		.map((group) => activityGroupParts(group).join(""))
+		.join(" · ");
+}
+
+/** [name, failure mark, detail] — split so the coloured line can tint each piece. */
+function activityGroupParts(group: ActivityGroup): [string, string, string] {
+	const mark = group.failed > 0 ? "✗" : "";
+	if (group.name === "bash") {
+		const exits =
+			group.nonZeroExits.length > 0
+				? group.nonZeroExits.map((e) => `exit ${e.code} ×${e.count}`).join(", ")
+				: group.failed < group.count
+					? "exit 0"
+					: "";
+		return [group.name, mark, ` ×${group.count}${exits ? ` (${exits})` : ""}`];
+	}
+	const shown = group.targets.slice(0, ACTIVITY_TARGETS_SHOWN);
+	const rest = group.targets.length - shown.length;
+	if (rest > 0) shown.push(`+${rest}`);
+	return [group.name, mark, shown.length > 0 ? ` ${shown.join(", ")}` : ""];
+}
+
+function activityLine(activity: readonly ActivityEntry[], width: number, deps: RenderDeps): string {
+	const separator = deps.fg("dim", " · ");
+	const text = groupActivity(activity)
+		.map((group) => {
+			const [name, mark, detail] = activityGroupParts(group);
+			const failing = mark !== "" || group.nonZeroExits.length > 0;
+			return (
+				deps.fg("muted", name) +
+				(mark ? deps.fg("error", mark) : "") +
+				(detail ? deps.fg(failing && group.name === "bash" ? "error" : "dim", detail) : "")
+			);
+		})
+		.join(separator);
+	// Same ending as the header preview: the line absorbs its own overflow.
+	return deps.truncateToWidth(`${ACTIVITY_INDENT}${text}`, width, "…");
+}
+
+function renderActivityList(
+	activity: readonly ActivityEntry[],
+	lines: string[],
+	width: number,
+	deps: RenderDeps,
+): void {
+	lines.push("");
+	const nameWidth = Math.max(...activity.map((entry) => entry.name.length));
+	for (const entry of activity) {
+		const failed = !entry.ok;
+		const columns = [entry.name.padEnd(nameWidth), entry.target ?? "", formatDuration(entry.durationMs) ?? ""];
+		if (entry.exitCode !== undefined && entry.exitCode !== 0) columns.push(`exit ${entry.exitCode}`);
+		const text = columns.filter((column) => column !== "").join("  ");
+		lines.push(deps.truncateToWidth(` ${OUTPUT_INDENT}${deps.fg(failed ? "error" : "muted", text)}`, width, "…"));
+	}
 }
 
 export function statusKind(state: ExecuteRenderState): StatusKind {
@@ -293,9 +398,16 @@ export function paintBackground(line: string, width: number, kind: StatusKind, d
 export function renderExecuteCell(state: ExecuteRenderState, width: number, deps: RenderDeps): string[] {
 	const safeWidth = Math.max(1, width);
 	const lines = [deps.truncateToWidth(` ${topLine(state, safeWidth, deps)}`, safeWidth, "")];
+	// What the cell touched. Collapsed: one summary line under the header, so
+	// a reader can follow without expanding; absent entirely when nothing was
+	// touched, so a pure-computation cell keeps its one-row height. Expanded:
+	// the full list after the output instead, one action per line.
+	const activity = state.details?.activity;
+	if (activity && activity.length > 0 && !state.expanded) lines.push(activityLine(activity, safeWidth, deps));
 	if (state.expanded) {
 		const hasCode = renderCode(state, lines, safeWidth, deps);
 		renderOutput(state, lines, safeWidth, hasCode, deps);
+		if (activity && activity.length > 0) renderActivityList(activity, lines, safeWidth, deps);
 	}
 	// The stack grows out of the cell that spawned it: one line per frame,
 	// beneath the output, indented by depth. A live stack asserts itself —

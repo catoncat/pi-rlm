@@ -11,6 +11,7 @@
 import { basename, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { ActivityEntry } from "../engine/activity.js";
 import { EngineBusyError, EngineManager, type ExecuteResult } from "../engine/index.js";
 import {
 	resolveRlmDropSet,
@@ -416,8 +417,13 @@ export default function (pi: ExtensionAPI) {
 			const { engine: m } = await lifecycle.acquire("cell");
 			const runCell = (engine: EngineManager): Promise<ExecuteResult> => {
 				// Accumulate: partial updates must only ever grow, or the TUI row height
-				// oscillates with each replacing chunk (visible as jumping).
+				// oscillates with each replacing chunk (visible as jumping). The activity
+				// trail is append-only for the same reason, and every update carries the
+				// whole of it: an update with only new output must not blank the line.
 				let streamed = "";
+				let activity: ActivityEntry[] | undefined;
+				const pushUpdate = () =>
+					onUpdate?.({ content: [{ type: "text", text: streamed }], details: activity ? { activity } : {} });
 				return engine.execute(params.code, {
 					signal,
 					// One identity end to end: the transcript's toolCallId is the
@@ -426,7 +432,11 @@ export default function (pi: ExtensionAPI) {
 					description: params.description,
 					onStream: (chunk) => {
 						streamed += chunk;
-						onUpdate?.({ content: [{ type: "text", text: streamed }], details: {} });
+						pushUpdate();
+					},
+					onActivity: (trail) => {
+						activity = trail;
+						pushUpdate();
 					},
 				});
 			};
@@ -490,6 +500,9 @@ export default function (pi: ExtensionAPI) {
 					resultTruncated: r.resultTruncated,
 					outputLimitReached: r.outputLimitReached,
 					cellDescription: params.description,
+					// Details only: `text` above is built from stdout/stderr/result and
+					// never from this, so the trail costs the model nothing.
+					activity: r.activity,
 				};
 				const result = {
 					content: [
