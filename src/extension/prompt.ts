@@ -111,7 +111,7 @@ const EVALUATOR_CONTROL_PROMPT = [
 	// Bun.$ template parse failures (232 cells / 113 sessions — fixed by routing
 	// the template through bash in the guest) and cells used as wait timers that
 	// hit the wall clock (the largest residual hang class).
-	"Bun.$ runs its template through bash, so full bash syntax works: heredocs, `$(...)`, pipes, redirect chains, escaped parens. An interpolated value becomes one escaped argument; to splice shell text verbatim, interpolate an object `{ raw: text }`. A dollar-brace in the template is still JS interpolation: escape the dollar for shell parameter expansion.",
+	"Bun.$ runs its template through bash, so full bash syntax works: heredocs, `$(...)`, pipes, redirect chains, escaped parens. Never wrap the command in `bash -c "..."` — that only adds a quoting layer. An interpolated value becomes one escaped argument; to splice shell text verbatim, interpolate an object `{ raw: text }`. A dollar-brace in the template is still JS interpolation: escape the dollar for shell parameter expansion.",
 	"",
 	"Each cell has a wall-clock limit (about 300 s, PI_RLM_CELL_TIMEOUT_MS); exceeding it kills the cell and restarts the evaluator. Never park a cell on a long sleep or poll loop, a headless `pi` run, a server, or a watcher. If a `process` tool is on your tool list, run such work through it (start / output / stop): it manages background processes and wakes you on ready, error, or exit, so never sleep-poll for it. Without that tool, start the work detached (`Bun.spawn` with stdout to a log file, or `nohup … &` from a script), return immediately, and check the log or status in a later cell. Keep any single in-cell wait well under a minute.",
 	"",
