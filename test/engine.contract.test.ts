@@ -1261,6 +1261,56 @@ describe("namespace economy", () => {
 	});
 });
 
+// ── 10c. Prelude ──────────────────────────────────────────────────────────────
+// Functions cannot ride the snapshot, so every restart used to cost the agent
+// the same fs/path/os imports again, plus a "Failed: existsSync, …" line about
+// them. The common helpers are bound before the first cell and owned by the
+// engine: present in every fresh namespace, absent from every snapshot report.
+
+describe("prelude", () => {
+	test("fs/path/os helpers are callable in a fresh engine without an import", async () => {
+		const m = engine();
+		const r = await m.execute(
+			"`${typeof existsSync}:${typeof readdirSync}:${typeof join}:${typeof homedir}:${existsSync(tmpdir())}:${basename(join('a', 'b.ts'))}`",
+		);
+		expect(r.status).toBe("ok");
+		expect(r.result).toContain("function:function:function:function:true:b.ts");
+	});
+
+	test("the prelude is outside the snapshot and comes back after a restart", async () => {
+		const snapshot = { path: join(tempDir(), "ns.snapshot"), debounceMs: 600_000 };
+		const m1 = engine({ snapshot });
+		await m1.execute("let mine = existsSync('/');");
+		const snap = await m1.snapshotState();
+		expect(snap?.saved).toEqual(["mine"]);
+		expect(snap?.failed).toEqual([]);
+		expect(await m1.listNamespaceNames()).toEqual(["mine"]);
+		await m1.kill();
+
+		const m2 = engine({ snapshot });
+		await m2.start();
+		const restore = await m2.restoreState();
+		expect(restore?.restored).toEqual(["mine"]);
+		expect(restore?.failed).toEqual([]);
+		expect((await m2.execute("`${mine}:${typeof existsSync}`")).result).toContain("true:function");
+	});
+
+	// A model that imports the helper anyway must not be punished, and one that
+	// deliberately rebinds the name owns it from then on like any variable.
+	test("importing or reassigning a preloaded name is an ordinary write", async () => {
+		const m = engine({ snapshot: { path: join(tempDir(), "ns.snapshot"), debounceMs: 600_000 } });
+		const imported = await m.execute('import { existsSync, statSync } from "node:fs"; typeof statSync');
+		expect(imported.status).toBe("ok");
+		expect(imported.result).toContain("function");
+		// Same module instance: still engine-owned, still not in the snapshot.
+		expect((await m.snapshotState())?.saved).toEqual([]);
+		const rebound = await m.execute("join = 'mine now'; join");
+		expect(rebound.status).toBe("ok");
+		expect(rebound.result).toContain("mine now");
+		expect((await m.snapshotState())?.saved).toEqual(["join"]);
+	});
+});
+
 // ── 11. Namespace listing ─────────────────────────────────────────────────────
 // The session reports what it revived, which requires knowing which names
 // belong to the agent rather than to the engine.

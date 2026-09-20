@@ -21,10 +21,14 @@
 
 import { deserialize, serialize } from "bun:jsc";
 import { AsyncLocalStorage } from "node:async_hooks";
+import * as nodeFs from "node:fs";
 import { createReadStream, writeSync } from "node:fs";
+import * as nodeOs from "node:os";
+import * as nodePath from "node:path";
 import { createInterface } from "node:readline";
 import { format } from "node:util";
 import { importNpm } from "./npm.js";
+import { PRELUDE_MODULES, type PreludeModule } from "./prelude.js";
 import {
 	decodeMessage,
 	encodeMessage,
@@ -607,7 +611,28 @@ const RLM_HANDLE = {
 /** Names owned by the engine; snapshot skips them while they hold the live value. */
 const INTERNAL_BINDINGS = new Map<string, unknown>();
 
+/**
+ * The preloaded fs/path/os helpers (see prelude.ts), resolved once from the
+ * guest's own module instances. A cell that imports the same name gets the
+ * same function back, so the binding still reads as engine-owned and stays
+ * out of the snapshot; a cell that assigns something else over it owns that
+ * name from then on, exactly like any other variable.
+ */
+const PRELUDE_SOURCES: Record<PreludeModule, Record<string, unknown>> = {
+	"node:fs": nodeFs as unknown as Record<string, unknown>,
+	"node:path": nodePath as unknown as Record<string, unknown>,
+	"node:os": nodeOs as unknown as Record<string, unknown>,
+};
+const PRELUDE_BINDINGS = new Map<string, unknown>();
+for (const [module, names] of Object.entries(PRELUDE_MODULES) as [PreludeModule, readonly string[]][]) {
+	for (const name of names) PRELUDE_BINDINGS.set(name, PRELUDE_SOURCES[module][name]);
+}
+
 function installBootstrapBindings(): void {
+	for (const [name, value] of PRELUDE_BINDINGS) {
+		namespace[name] = value;
+		INTERNAL_BINDINGS.set(name, value);
+	}
 	namespace.rlm = RLM_HANDLE;
 	INTERNAL_BINDINGS.set("rlm", RLM_HANDLE);
 	// Cells resolve `Bun` through the namespace, so this shadows the global with

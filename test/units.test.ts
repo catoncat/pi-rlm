@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseNpmSpecifier } from "../src/engine/npm.js";
+import { PRELUDE_MODULES } from "../src/engine/prelude.js";
 import { decodeMessage, encodeMessage } from "../src/engine/protocol.js";
 import { transformCell } from "../src/engine/transform.js";
 import {
@@ -365,6 +366,16 @@ describe("system prompt", () => {
 		const prompt = buildRlmTsPrompt({ cwd: "/tmp" });
 		expect(prompt).toContain('import { z } from "npm:zod@4"');
 		expect(prompt).toContain("isolated cache");
+	});
+
+	// What the prompt says is preloaded must be what the guest binds; both read
+	// prelude.ts, so the line is checked against that list rather than a copy.
+	test("the preloaded fs/path/os names are advertised from the shared prelude list", () => {
+		const prompt = buildRlmTsPrompt({ cwd: "/tmp" });
+		expect(prompt).toContain("Preloaded in the namespace, no import needed");
+		for (const [module, names] of Object.entries(PRELUDE_MODULES)) {
+			expect(prompt).toContain(`${module}: ${names.join(", ")}`);
+		}
 	});
 
 	test("namespace hygiene doctrine: forget for cleanup, deferred values load on read", () => {
