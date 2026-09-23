@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Verify pi-rlm-keep-extension-tools: tiered surface helpers (resident +
- * load_tools), prompt wiring, and the rlm-toggle mirror of keep-tools.ts.
+ * load_tools), prompt wiring, and rlm-toggle importing this repo's keep-tools.ts.
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -197,54 +197,42 @@ console.log("E prompt section ok");
 // rlm-toggle 现在作为独立包安装(github.com/catoncat/pi-rlm-local → packages/rlm-toggle/src);
 // 旧布局(~/.pi/agent/extensions 目录扩展)仍兼容,P I_RLM_TOGGLE_SRC_DIR 可覆盖。
 const EXT_DIR = process.env.PI_RLM_TOGGLE_SRC_DIR ?? join(homedir(), ".pi", "agent", "git", "github.com", "catoncat", "pi-rlm-local", "packages", "rlm-toggle", "src");
-const toggleKeep = [
-  join(EXT_DIR, "keep-tools.ts"),
-  join(EXT_DIR, "rlm-toggle", "keep-tools.ts"),
-  join(EXT_DIR, "rlm-keep-tools.ts"),
-].find(existsSync);
+// rlm-toggle 直接 import 本仓库的 keep-tools.ts(不再有镜像):本地副本一旦出现就是漂移源。
 const toggle = [
   join(EXT_DIR, "index.ts"),
   join(EXT_DIR, "rlm-toggle", "index.ts"),
   join(EXT_DIR, "rlm-toggle.ts"),
 ].find(existsSync);
-if (!toggleKeep || !toggle) {
-  console.error("F missing rlm-toggle helpers (looked for rlm-toggle/ dir and flat layout)");
+if (!toggle) {
+  console.error("F missing rlm-toggle entry (looked for rlm-toggle/ dir and flat layout)");
   process.exit(1);
 }
-const mirror = await import(toggleKeep);
-const md = mirror.resolveRlmDropSet({});
-if (md.size !== d.size) {
-  console.error("F mirror drop size drift", md.size, d.size);
-  process.exit(1);
-}
-for (const fn of ["resolveRlmResidentTools", "resolveRlmResidentSurface", "resolveRlmEnsuredSurface", "sameToolSet"]) {
-  if (typeof mirror[fn] !== "function") {
-    console.error("F mirror missing", fn);
-    process.exit(1);
-  }
-}
-const mr = mirror.resolveRlmResidentTools({});
-if (JSON.stringify(mr) !== JSON.stringify(resident)) {
-  console.error("F mirror resident drift", mr, resident);
-  process.exit(1);
-}
-const mrOverride = mirror.resolveRlmResidentTools({ PI_RLM_RESIDENT_TOOLS: "advisor" });
-if (JSON.stringify(mrOverride) !== JSON.stringify(residentOverride)) {
-  console.error("F mirror resident override drift", mrOverride, residentOverride);
-  process.exit(1);
-}
-const mirrorOptions = { drop: md, resident: mr, always: surfaceOptions.always };
-const ma = mirror.resolveRlmResidentSurface(all, mirrorOptions);
-if (JSON.stringify(ma) !== JSON.stringify(active)) {
-  console.error("F mirror resident surface drift", ma, active);
-  process.exit(1);
-}
-const me = mirror.resolveRlmEnsuredSurface(["execute", "load_tools", "rlm_mode", "advisor", "read"], all, mirrorOptions);
-if (JSON.stringify(me) !== JSON.stringify(ensured)) {
-  console.error("F mirror ensured surface drift", me, ensured);
+const strayMirror = [
+  join(EXT_DIR, "keep-tools.ts"),
+  join(EXT_DIR, "rlm-toggle", "keep-tools.ts"),
+  join(EXT_DIR, "rlm-keep-tools.ts"),
+].find(existsSync);
+if (strayMirror) {
+  console.error("F rlm-toggle has a local keep-tools mirror again; import pi-rlm's instead:", strayMirror);
   process.exit(1);
 }
 const toggleSrc = readFileSync(toggle, "utf8");
+if (!toggleSrc.includes('/pi-rlm/src/extension/keep-tools.ts"')) {
+  console.error("F rlm-toggle does not import pi-rlm's keep-tools.ts");
+  process.exit(1);
+}
+// 真正按 rlm-toggle 的相对路径解析一次,确认指到的就是本仓库这份。
+const importPath = /from "(\.[^"]*\/pi-rlm\/src\/extension\/keep-tools\.ts)"/.exec(toggleSrc)?.[1];
+const resolved = importPath ? new URL(importPath, "file://" + toggle).pathname : "";
+if (!existsSync(resolved)) {
+  console.error("F rlm-toggle keep-tools import does not resolve:", importPath, "->", resolved);
+  process.exit(1);
+}
+const linked = await import(resolved);
+if (JSON.stringify(linked.resolveRlmResidentTools({})) !== JSON.stringify(resident)) {
+  console.error("F rlm-toggle resolves a different keep-tools.ts:", resolved);
+  process.exit(1);
+}
 if (!toggleSrc.includes("resolveRlmResidentSurface") || !toggleSrc.includes("resolveRlmEnsuredSurface")) {
   console.error("F rlm-toggle not using the tiered surface");
   process.exit(1);
@@ -257,6 +245,6 @@ if (toggleSrc.includes('setActiveTools(["execute", "rlm_mode"])')) {
   console.error("F rlm-toggle still hard-collapses");
   process.exit(1);
 }
-console.log("F rlm-toggle mirror ok");
+console.log("F rlm-toggle uses pi-rlm keep-tools ok");
 
 console.log("all keep-extension-tools checks passed");
